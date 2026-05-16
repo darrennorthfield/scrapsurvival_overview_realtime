@@ -38,9 +38,27 @@ var (
 	updatedAt   time.Time
 	logsDir     string
 	serverPort  int
+
+	cells       = make(map[[2]int]Cell)
+	cellsMu     sync.RWMutex
+	cellsSeed   string
+	cellsTotal  int
+	cellsLoaded bool   // true once we've seen SMOVERVIEW_CELLS_END
+	pendingCells map[[2]int]Cell // accumulator between BEGIN and END
 )
 
-var posLineRE = regexp.MustCompile(`SMOVERVIEW_POS:(\[.*\])`)
+type Cell struct {
+	X    int    `json:"x"`
+	Y    int    `json:"y"`
+	Tile string `json:"t,omitempty"`
+}
+
+var (
+	posLineRE       = regexp.MustCompile(`SMOVERVIEW_POS:(\[.*\])`)
+	cellsBeginRE    = regexp.MustCompile(`SMOVERVIEW_CELLS_BEGIN:(\{.*\})`)
+	cellsBatchRE    = regexp.MustCompile(`SMOVERVIEW_CELLS:(\[.*\])`)
+	cellsEndRE      = regexp.MustCompile(`SMOVERVIEW_CELLS_END`)
+)
 
 func main() {
 	smPath := flag.String("sm-path", defaultSMPath, "Scrap Mechanic install directory")
@@ -58,6 +76,7 @@ func main() {
 	go tailLogs()
 
 	http.HandleFunc("/positions", handlePositions)
+	http.HandleFunc("/cells", handleCells)
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/info", handleInfo)
 	http.HandleFunc("/", handleIndex)
@@ -229,23 +248,69 @@ func findNewestGameLog(dir string) string {
 }
 
 func handleLine(line string) {
-	m := posLineRE.FindStringSubmatch(line)
-	if m == nil {
+	if m := posLineRE.FindStringSubmatch(line); m != nil {
+		var players []Player
+		if err := json.Unmarshal([]byte(m[1]), &players); err != nil {
+			log.Printf("bad SMOVERVIEW_POS payload: %v", err)
+			return
+		}
+		positionsMu.Lock()
+		// Each emit is authoritative for who is connected: replace, don't merge.
+		positions = make(map[int]Player, len(players))
+		for _, p := range players {
+			positions[p.ID] = p
+		}
+		updatedAt = time.Now()
+		positionsMu.Unlock()
 		return
 	}
-	var players []Player
-	if err := json.Unmarshal([]byte(m[1]), &players); err != nil {
-		log.Printf("bad SMOVERVIEW_POS payload: %v", err)
+
+	if m := cellsBeginRE.FindStringSubmatch(line); m != nil {
+		var header struct {
+			Seed  json.Number `json:"seed"`
+			Count int         `json:"count"`
+		}
+		_ = json.Unmarshal([]byte(m[1]), &header)
+		cellsMu.Lock()
+		cellsSeed = string(header.Seed)
+		cellsTotal = header.Count
+		pendingCells = make(map[[2]int]Cell, header.Count)
+		cellsLoaded = false
+		cellsMu.Unlock()
+		log.Printf("cells dump starting: seed=%s count=%d", cellsSeed, cellsTotal)
 		return
 	}
-	positionsMu.Lock()
-	// Each emit is authoritative for who is connected: replace, don't merge.
-	positions = make(map[int]Player, len(players))
-	for _, p := range players {
-		positions[p.ID] = p
+
+	if m := cellsBatchRE.FindStringSubmatch(line); m != nil {
+		var batch []Cell
+		if err := json.Unmarshal([]byte(m[1]), &batch); err != nil {
+			log.Printf("bad SMOVERVIEW_CELLS batch: %v", err)
+			return
+		}
+		cellsMu.Lock()
+		if pendingCells == nil {
+			// Stray batch with no BEGIN seen yet (mid-stream restart) — start fresh.
+			pendingCells = make(map[[2]int]Cell)
+		}
+		for _, c := range batch {
+			pendingCells[[2]int{c.X, c.Y}] = c
+		}
+		cellsMu.Unlock()
+		return
 	}
-	updatedAt = time.Now()
-	positionsMu.Unlock()
+
+	if cellsEndRE.MatchString(line) {
+		cellsMu.Lock()
+		if pendingCells != nil {
+			cells = pendingCells
+			pendingCells = nil
+			cellsLoaded = true
+		}
+		n := len(cells)
+		cellsMu.Unlock()
+		log.Printf("cells dump complete: %d cells", n)
+		return
+	}
 }
 
 type positionsResponse struct {
@@ -281,6 +346,31 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"logsDir":%q}`, logsDir)
+}
+
+func handleCells(w http.ResponseWriter, _ *http.Request) {
+	cellsMu.RLock()
+	out := struct {
+		Loaded bool   `json:"loaded"`
+		Seed   string `json:"seed,omitempty"`
+		Count  int    `json:"count"`
+		Cells  []Cell `json:"cells"`
+	}{
+		Loaded: cellsLoaded,
+		Seed:   cellsSeed,
+		Count:  len(cells),
+		Cells:  make([]Cell, 0, len(cells)),
+	}
+	for _, c := range cells {
+		out.Cells = append(out.Cells, c)
+	}
+	cellsMu.RUnlock()
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	// Cells are static for a session — let the browser cache briefly.
+	w.Header().Set("Cache-Control", "max-age=60")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func handleInfo(w http.ResponseWriter, _ *http.Request) {
@@ -370,6 +460,7 @@ const map = L.map('map', {
   crs: L.CRS.Simple,
   minZoom: -4, maxZoom: 4, zoomSnap: 0.25, zoomDelta: 0.5,
   attributionControl: false,
+  preferCanvas: true,
 });
 map.setView([0, 0], -1);
 
@@ -385,6 +476,81 @@ map.setView([0, 0], -1);
   L.polyline(minor.flat(), { color: '#222a33', weight: 0.5, interactive: false }).addTo(map);
   L.polyline(major.flat(), { color: '#33404d', weight: 0.8, interactive: false }).addTo(map);
 })();
+
+// --- Terrain layer ---------------------------------------------------------
+// Cells dump comes in as 16k+ records (one per SM cell) with a tile UUID.
+// We don't know the UUID→biome mapping yet, so hash the UUID to a colour and
+// paint a tiny canvas (8px per cell), then drape it on the map as an image
+// overlay. Cheap to render even for huge worlds, sharp at high zooms.
+function colorForTile(uuid) {
+  if (!uuid) return '#262c33';
+  let h = 5381;
+  for (let i = 0; i < uuid.length; i++) {
+    h = ((h << 5) + h + uuid.charCodeAt(i)) | 0;
+  }
+  const hue = (Math.abs(h) * 37) % 360;
+  // Two slight lightness bands so adjacent same-tile clusters have some
+  // texture rather than being flat. Picked from the high bits.
+  const light = 24 + ((Math.abs(h) >> 8) % 12);
+  return 'hsl(' + hue + ',32%,' + light + '%)';
+}
+
+let terrainOverlay = null;
+let terrainLoadedFor = '';   // host:cellsLoaded snapshot key — avoid re-rendering identical data
+
+async function loadTerrain() {
+  try {
+    const r = await fetch(endpoint('/cells'));
+    const data = await r.json();
+    if (!data.loaded || !data.cells || data.cells.length === 0) return;
+    const key = host + '|' + data.seed + '|' + data.count;
+    if (key === terrainLoadedFor) return;
+    terrainLoadedFor = key;
+    renderTerrain(data.cells);
+  } catch (e) { /* probably not running yet */ }
+}
+
+function renderTerrain(cellArr) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const c of cellArr) {
+    if (c.x < minX) minX = c.x;
+    if (c.x > maxX) maxX = c.x;
+    if (c.y < minY) minY = c.y;
+    if (c.y > maxY) maxY = c.y;
+  }
+  const scale = 8; // canvas pixels per SM cell
+  const w = (maxX - minX + 1) * scale;
+  const h = (maxY - minY + 1) * scale;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#1c2128';
+  ctx.fillRect(0, 0, w, h);
+  for (const c of cellArr) {
+    ctx.fillStyle = colorForTile(c.t);
+    const px = (c.x - minX) * scale;
+    const py = (maxY - c.y) * scale; // flip y so north is up on the canvas
+    ctx.fillRect(px, py, scale, scale);
+  }
+
+  // Convert cell-grid bounds to world-space, then to Leaflet CRS.Simple (lat=-y).
+  const worldMinX = minX * 64, worldMaxX = (maxX + 1) * 64;
+  const worldMinY = minY * 64, worldMaxY = (maxY + 1) * 64;
+  const bounds = [[-worldMaxY, worldMinX], [-worldMinY, worldMaxX]];
+
+  if (terrainOverlay) map.removeLayer(terrainOverlay);
+  terrainOverlay = L.imageOverlay(cv.toDataURL(), bounds, {
+    opacity: 0.85, interactive: false,
+  }).addTo(map);
+  terrainOverlay.bringToBack();
+}
+
+loadTerrain();
+setInterval(loadTerrain, 30000);
+// Also reload terrain when the host changes (LAN viewer mode).
+// (The hostInput change handler below already triggers refresh(); we hook into
+// it by re-running loadTerrain() whenever host changes.)
 
 const markers = {}; // id -> L.marker
 let zoomedToInitial = false;
@@ -451,13 +617,16 @@ hostInput.value = host;
 hostInput.addEventListener('change', () => {
   host = hostInput.value.trim();
   localStorage.setItem('sm_overview_host', host);
-  // Wipe markers so we don't keep stale positions from the previous source
+  // Wipe markers and terrain so we don't keep stale data from the previous source.
   for (const id of Object.keys(markers)) {
     map.removeLayer(markers[id]);
     delete markers[id];
   }
+  if (terrainOverlay) { map.removeLayer(terrainOverlay); terrainOverlay = null; }
+  terrainLoadedFor = '';
   zoomedToInitial = false;
   refresh();
+  loadTerrain();
 });
 
 async function refresh() {

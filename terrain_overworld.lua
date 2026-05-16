@@ -156,13 +156,35 @@ function Load()
 			sm.log.warning( "sm_overview cell enumeration failed: " .. tostring(perCellErr) )
 		end
 		if #cells > 0 then
-			cells[1]["bounds"] = g_cellData.bounds
-			cells[1]["seed"] = g_cellData.seed
-			local saveOk, saveErr = pcall( sm.json.save, cells, "$SURVIVAL_DATA/cells.json" )
-			if saveOk then
-				sm.log.warning( "sm_overview wrote cells.json (" .. #cells .. " cells)" )
-			else
-				sm.log.warning( "sm_overview cells.json save FAILED: " .. tostring(saveErr) )
+			-- Content-id sandbox blocks sm.json.save from this script, so emit
+			-- cell data through the log instead — the same trick we use for
+			-- player positions. The desktop tool tails the log and reassembles.
+			-- Guard: Load() can run several times per session (per terrain area),
+			-- but cells are deterministic from the seed, so emit only the first
+			-- time. _G persists across Load() calls within the same Lua state.
+			if not _G.g_smOverviewCellsEmitted then
+				_G.g_smOverviewCellsEmitted = true
+				sm.log.warning( string.format(
+					'SMOVERVIEW_CELLS_BEGIN:{"seed":%s,"count":%d}',
+					tostring(g_cellData.seed),
+					#cells
+				) )
+				local BATCH_SIZE = 100
+				local batch = {}
+				for _, c in ipairs(cells) do
+					local s = string.format( '{"x":%d,"y":%d', c.x, c.y )
+					if c.tile then s = s .. string.format( ',"t":%q', c.tile ) end
+					s = s .. '}'
+					batch[#batch+1] = s
+					if #batch >= BATCH_SIZE then
+						sm.log.warning( 'SMOVERVIEW_CELLS:[' .. table.concat(batch, ',') .. ']' )
+						batch = {}
+					end
+				end
+				if #batch > 0 then
+					sm.log.warning( 'SMOVERVIEW_CELLS:[' .. table.concat(batch, ',') .. ']' )
+				end
+				sm.log.warning( 'SMOVERVIEW_CELLS_END' )
 			end
 			cells = nil
 		end
