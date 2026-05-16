@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -78,10 +77,17 @@ func main() {
 
 // tailLogs continuously follows the newest game-*.log in the Logs directory.
 // When Scrap Mechanic rolls to a new log file, we detect it and switch.
+//
+// Tracks the read offset manually and Seeks to it before every Read because
+// once os.File.Read returns io.EOF on macOS the file handle stays "sticky" at
+// EOF and ignores subsequently appended bytes. An explicit seek resets that.
+// (Linux is more forgiving but the seek is a cheap no-op there.)
 func tailLogs() {
 	var currentPath string
 	var currentFile *os.File
-	var reader *bufio.Reader
+	var offset int64
+	var carry []byte // partial line left over from the previous read
+	buf := make([]byte, 8192)
 
 	for {
 		newest := findNewestGameLog(logsDir)
@@ -96,29 +102,41 @@ func tailLogs() {
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			// New session — start from beginning so we don't miss early lines.
-			// (Old sessions: skip to end to avoid replaying stale positions.)
-			if currentPath != "" {
-				// switched to a newer file — read from start
-				f.Seek(0, io.SeekStart)
+			// First file we ever open — skip to EOF so we ignore stale lines
+			// from before the binary started. Subsequent rollovers (currentPath
+			// already set) read from the beginning so we don't miss the early
+			// SurvivalGame.server_onCreate lines of the new session.
+			if currentPath == "" {
+				offset, _ = f.Seek(0, io.SeekEnd)
 			} else {
-				// first open of newest existing file — skip ahead so we only
-				// react to lines emitted after the binary starts
-				f.Seek(0, io.SeekEnd)
+				offset = 0
 			}
 			currentFile = f
 			currentPath = newest
-			reader = bufio.NewReader(f)
+			carry = nil
 			log.Printf("tailing %s", filepath.Base(newest))
 		}
 
-		if reader != nil {
+		if currentFile != nil {
 			for {
-				line, err := reader.ReadString('\n')
-				if len(line) > 0 {
-					handleLine(line)
+				if _, err := currentFile.Seek(offset, io.SeekStart); err != nil {
+					log.Printf("seek: %v", err)
+					break
 				}
-				if err == io.EOF {
+				n, err := currentFile.Read(buf)
+				if n > 0 {
+					offset += int64(n)
+					carry = append(carry, buf[:n]...)
+					for {
+						i := bytesIndex(carry, '\n')
+						if i < 0 {
+							break
+						}
+						handleLine(string(carry[:i]))
+						carry = carry[i+1:]
+					}
+				}
+				if err == io.EOF || n == 0 {
 					break
 				}
 				if err != nil {
@@ -130,6 +148,15 @@ func tailLogs() {
 
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func bytesIndex(b []byte, c byte) int {
+	for i, v := range b {
+		if v == c {
+			return i
+		}
+	}
+	return -1
 }
 
 func findNewestGameLog(dir string) string {
@@ -222,43 +249,149 @@ func handleIndex(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, indexHTML)
 }
 
-// Minimal viewer: shows positions as JSON refreshed every second.
-// Phase 3 replaces this with the Leaflet map UI.
+// Leaflet-based map with realtime player markers.
+// Uses CRS.Simple so we can plot SM world coords directly without a lat/lon projection.
+// Negates y so north points up on screen (SM y grows northward).
 const indexHTML = `<!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>sm_overview realtime</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin="">
 <style>
-body { font-family: ui-monospace, monospace; padding: 24px; background: #1e1e1e; color: #e4e4e4; }
-h1 { margin-top: 0; }
-.card { background: #2a2a2a; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
-.muted { color: #999; font-size: 13px; }
-pre { margin: 0; }
+  html, body { height: 100%; margin: 0; padding: 0; background: #14181d; color: #e4e4e4;
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #map { width: 100%; height: 100%; background: #1c2128; }
+  .leaflet-container { background: #1c2128; outline: none; }
+  #panel {
+    position: fixed; top: 12px; right: 12px; z-index: 1000;
+    background: rgba(20,24,29,0.92); padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; min-width: 200px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  #panel h1 { margin: 0 0 6px 0; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
+  #status { color: #aaa; font-size: 12px; margin-bottom: 6px; }
+  #players { font-size: 12px; }
+  #players .row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+  #players .dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid #fff; }
+  .player-tooltip {
+    background: rgba(0,0,0,0.78) !important; color: #fff !important;
+    border: none !important; box-shadow: none !important;
+    font: 11px ui-monospace, monospace !important; padding: 2px 6px !important;
+  }
+  .player-tooltip::before { display: none !important; }
 </style>
 </head>
 <body>
-<h1>sm_overview realtime</h1>
-<p class="muted">Phase 2 diagnostic UI. Phase 3 will replace this with the Leaflet map.</p>
-<div class="card">
-  <div id="status" class="muted">connecting…</div>
-  <pre id="payload">{}</pre>
+<div id="map"></div>
+<div id="panel">
+  <h1>sm_overview realtime</h1>
+  <div id="status">connecting…</div>
+  <div id="players"></div>
 </div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""></script>
 <script>
-async function tick() {
+const COLORS = ['#6cb6ff','#ffae57','#ff7ab2','#a98cff','#7be6c4','#ffd965','#ff7878','#9be888'];
+const colorFor = id => COLORS[id % COLORS.length];
+
+const map = L.map('map', {
+  crs: L.CRS.Simple,
+  minZoom: -4, maxZoom: 4, zoomSnap: 0.25, zoomDelta: 0.5,
+  attributionControl: false,
+});
+map.setView([0, 0], -1);
+
+// Background grid: 64-unit lines (SM cells are 64) + thicker every 512.
+(function drawGrid() {
+  const range = 4096, step = 64, big = 512;
+  const minor = [], major = [];
+  for (let i = -range; i <= range; i += step) {
+    const arr = (i % big === 0) ? major : minor;
+    arr.push([[-range, i], [range, i]]);
+    arr.push([[i, -range], [i, range]]);
+  }
+  L.polyline(minor.flat(), { color: '#222a33', weight: 0.5, interactive: false }).addTo(map);
+  L.polyline(major.flat(), { color: '#33404d', weight: 0.8, interactive: false }).addTo(map);
+})();
+
+const markers = {}; // id -> L.marker
+let zoomedToInitial = false;
+
+function smToLatLng(p) {
+  // CRS.Simple: lat = y axis (we negate so north=up), lng = x axis.
+  return [-p.y, p.x];
+}
+
+function makeIcon(p) {
+  return L.divIcon({
+    className: '',
+    html: '<div style="width:14px;height:14px;border-radius:50%;background:' + colorFor(p.id) +
+          ';border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.7);"></div>',
+    iconSize: [14, 14], iconAnchor: [7, 7],
+  });
+}
+
+function renderPanel(players, ageSec) {
+  const statusEl = document.getElementById('status');
+  const listEl = document.getElementById('players');
+  if (!players.length) {
+    statusEl.textContent = '🔴 no data — is Scrap Mechanic running and in a Survival save?';
+    listEl.innerHTML = '';
+    return;
+  }
+  const tag = ageSec <= 2 ? '🟢 live' : (ageSec < 10 ? '🟡 stale (' + ageSec + 's)' : '🔴 stale (' + ageSec + 's)');
+  statusEl.textContent = tag + ' · ' + players.length + ' player' + (players.length === 1 ? '' : 's');
+  listEl.innerHTML = players.map(p =>
+    '<div class="row"><span class="dot" style="background:' + colorFor(p.id) + '"></span>' +
+    '<span>' + escapeHtml(p.name) + '</span>' +
+    '<span style="color:#777;margin-left:auto">' + p.x.toFixed(0) + ',' + p.y.toFixed(0) + '</span></div>'
+  ).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+}
+
+async function refresh() {
   try {
     const r = await fetch('/positions');
     const data = await r.json();
-    document.getElementById('payload').textContent = JSON.stringify(data, null, 2);
-    const age = data.age_seconds;
-    let status = age <= 2 ? '🟢 live' : (age < 10 ? '🟡 stale (' + age + 's)' : '🔴 no data — is Scrap Mechanic running and in a Survival save?');
-    document.getElementById('status').textContent = status;
+    const players = data.players || [];
+    renderPanel(players, data.age_seconds || 0);
+
+    const seen = new Set();
+    for (const p of players) {
+      seen.add(p.id);
+      if (!markers[p.id]) {
+        const m = L.marker(smToLatLng(p), { icon: makeIcon(p) }).addTo(map);
+        m.bindTooltip(p.name, { permanent: true, direction: 'top', offset: [0, -8], className: 'player-tooltip' });
+        markers[p.id] = m;
+      } else {
+        markers[p.id].setLatLng(smToLatLng(p));
+      }
+    }
+    for (const id of Object.keys(markers)) {
+      if (!seen.has(parseInt(id, 10))) {
+        map.removeLayer(markers[id]);
+        delete markers[id];
+      }
+    }
+
+    if (!zoomedToInitial && players.length > 0) {
+      map.setView(smToLatLng(players[0]), 1);
+      zoomedToInitial = true;
+    }
   } catch (e) {
-    document.getElementById('status').textContent = 'error: ' + e;
+    document.getElementById('status').textContent = 'error: ' + e.message;
   }
 }
-tick();
-setInterval(tick, 1000);
+
+refresh();
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>
