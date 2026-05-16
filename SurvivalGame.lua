@@ -55,7 +55,7 @@ local function writePlayersJson()
 			} )
 		end
 	end
-	sm.json.save( { players = players }, "$SURVIVAL_DATA/players.json" )
+	sm.json.save( { players = players }, "$SAVE_DATA/players.json" )
 end
 
 local IntroFadeDuration = 1.1
