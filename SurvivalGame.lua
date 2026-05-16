@@ -40,22 +40,19 @@ local g_playerSyncTick = 0
 
 local function writePlayersJson()
 	local allPlayers = sm.player.getAllPlayers()
-	sm.log.warning( "sm_overview: writePlayersJson called, players=" .. tostring( #allPlayers ) )
-	local players = {}
+	local parts = {}
 	for _, player in ipairs( allPlayers ) do
 		local character = player:getCharacter()
 		if character and sm.exists( character ) then
 			local pos = character:getWorldPosition()
-			table.insert( players, {
-				id = player.id,
-				name = player.name,
-				x = pos.x,
-				y = pos.y,
-				z = pos.z,
-			} )
+			parts[#parts + 1] = string.format(
+				'{"id":%d,"name":%q,"x":%.3f,"y":%.3f,"z":%.3f}',
+				player.id, player.name, pos.x, pos.y, pos.z
+			)
 		end
 	end
-	sm.json.save( { players = players }, "$SAVE_DATA/players.json" )
+	-- Emit as a log line; the desktop tool tails logFile.txt and parses this prefix
+	sm.log.warning( "SMOVERVIEW_POS:[" .. table.concat( parts, "," ) .. "]" )
 end
 
 local IntroFadeDuration = 1.1
