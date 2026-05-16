@@ -130,30 +130,41 @@ function Load()
 		CreateCellTileStorageKeys()
 
 		local cells = {}
-		forEveryCell( function( cellX, cellY )
-			local cell = {}
-			cell["x"] = cellX
-			cell["y"] = cellY;
-			cell["tileid"] = GetLegacyID(GetCellTileUid( cellX, cellY )) -- modified by Arkanorian to work for update 0.6.0
-			cell["flags"] = g_cellData.flags[cellY][cellX]
-			cell["rotation"] = g_cellData.rotation[cellY][cellX]
-			-- cell["elevation"] = g_cellData.elevation[cellY][cellX]
-			-- cell["clifflevel"] = g_cellData.cliffLevel[cellY][cellX]
-			-- cell["offx"] = g_cellData.tileOffsetX[cellY][cellX]
-			-- cell["offy"] = g_cellData.tileOffsetY[cellY][cellX]
-			-- cell["celldebug"] = g_cellData.cellDebug[cellY][cellX]
-			-- cell["cornerdebug"] = g_cellData.cornerDebug[cellY][cellX]
-			-- cell["variation"] = sm.noise.intNoise2d( cellX, cellY, g_cellData.seed + 2854 )
-
-			cells[#cells+1] = cell
+		local ok, perCellErr = pcall( function()
+			forEveryCell( function( cellX, cellY )
+				local cell = {}
+				cell["x"] = cellX
+				cell["y"] = cellY
+				-- GetLegacyID was removed sometime after SM 0.6.x; emit the
+				-- raw tile UUID instead. The downstream map renderer can map
+				-- UUIDs to colours.
+				local uid = GetCellTileUid( cellX, cellY )
+				if uid then cell["tile"] = tostring(uid) end
+				-- flags / rotation may or may not exist in the current cellData
+				-- layout — guard each access so a missing field doesn't kill
+				-- the whole dump.
+				if g_cellData.flags and g_cellData.flags[cellY] then
+					cell["flags"] = g_cellData.flags[cellY][cellX]
+				end
+				if g_cellData.rotation and g_cellData.rotation[cellY] then
+					cell["rotation"] = g_cellData.rotation[cellY][cellX]
+				end
+				cells[#cells+1] = cell
+			end )
 		end )
+		if not ok then
+			sm.log.warning( "sm_overview cell enumeration failed: " .. tostring(perCellErr) )
+		end
 		if #cells > 0 then
 			cells[1]["bounds"] = g_cellData.bounds
 			cells[1]["seed"] = g_cellData.seed
-			-- print("Writing Cell Json");
-			sm.json.save( cells, "$SURVIVAL_DATA/".."cells.json" )
-			cells = nil;
-			-- print("Wrote Cell Json");
+			local saveOk, saveErr = pcall( sm.json.save, cells, "$SURVIVAL_DATA/cells.json" )
+			if saveOk then
+				sm.log.warning( "sm_overview wrote cells.json (" .. #cells .. " cells)" )
+			else
+				sm.log.warning( "sm_overview cells.json save FAILED: " .. tostring(saveErr) )
+			end
+			cells = nil
 		end
 
 		return true
