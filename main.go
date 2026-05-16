@@ -404,6 +404,7 @@ const indexHTML = `<!doctype html>
                font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   #map { width: 100%; height: 100%; background: #1c2128; }
   .leaflet-container { background: #1c2128; outline: none; }
+  .leaflet-image-layer { image-rendering: pixelated; image-rendering: crisp-edges; }
   #panel {
     position: fixed; top: 12px; right: 12px; z-index: 1000;
     background: rgba(20,24,29,0.92); padding: 10px 14px; border-radius: 8px;
@@ -479,20 +480,56 @@ map.setView([0, 0], -1);
 
 // --- Terrain layer ---------------------------------------------------------
 // Cells dump comes in as 16k+ records (one per SM cell) with a tile UUID.
-// We don't know the UUID→biome mapping yet, so hash the UUID to a colour and
-// paint a tiny canvas (8px per cell), then drape it on the map as an image
-// overlay. Cheap to render even for huge worlds, sharp at high zooms.
-function colorForTile(uuid) {
+// We don't have a UUID→biome mapping, so do a frequency-based heuristic:
+// the most common UUIDs in this world get curated map-themed colours
+// (water/forest/meadow/field/desert in roughly that order — matches the
+// usual distribution in SM where lakes dominate); the long tail of less
+// common tiles falls back to a muted hash-based hue.
+//
+// Result: a recognisable map even without ground-truth biome info.
+
+// Curated palette ordered from "most common biome" downward. SM stats
+// frequently show LAKE >> MEADOW > FOREST > FIELD > others.
+const TOP_TILE_PALETTE = [
+  '#2c4d6a', // 1 - water/lake (blue)
+  '#3b5a3b', // 2 - meadow (green)
+  '#4a3f2b', // 3 - forest (dark brown-green)
+  '#6f6332', // 4 - field (olive/yellow-green)
+  '#7a6440', // 5 - autumn forest (warm)
+  '#8a8a52', // 6 - desert (tan)
+  '#5a5a5a', // 7 - burnt forest (grey)
+];
+
+let tileColorMap = {}; // uuid -> css colour, rebuilt when terrain loads
+
+function hashColorForTile(uuid) {
   if (!uuid) return '#262c33';
   let h = 5381;
-  for (let i = 0; i < uuid.length; i++) {
-    h = ((h << 5) + h + uuid.charCodeAt(i)) | 0;
-  }
+  for (let i = 0; i < uuid.length; i++) h = ((h << 5) + h + uuid.charCodeAt(i)) | 0;
   const hue = (Math.abs(h) * 37) % 360;
-  // Two slight lightness bands so adjacent same-tile clusters have some
-  // texture rather than being flat. Picked from the high bits.
   const light = 24 + ((Math.abs(h) >> 8) % 12);
-  return 'hsl(' + hue + ',32%,' + light + '%)';
+  return 'hsl(' + hue + ',26%,' + light + '%)';
+}
+
+function buildTileColors(cellArr) {
+  const freq = {};
+  for (const c of cellArr) {
+    if (!c.t) continue;
+    freq[c.t] = (freq[c.t] || 0) + 1;
+  }
+  const ranked = Object.entries(freq).sort((a, b) => b[1] - a[1]);
+  const map = {};
+  for (let i = 0; i < ranked.length; i++) {
+    map[ranked[i][0]] = i < TOP_TILE_PALETTE.length
+      ? TOP_TILE_PALETTE[i]
+      : hashColorForTile(ranked[i][0]);
+  }
+  return map;
+}
+
+function colorForTile(uuid) {
+  if (!uuid) return '#262c33';
+  return tileColorMap[uuid] || hashColorForTile(uuid);
 }
 
 let terrainOverlay = null;
@@ -511,6 +548,7 @@ async function loadTerrain() {
 }
 
 function renderTerrain(cellArr) {
+  tileColorMap = buildTileColors(cellArr);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const c of cellArr) {
     if (c.x < minX) minX = c.x;
@@ -518,7 +556,7 @@ function renderTerrain(cellArr) {
     if (c.y < minY) minY = c.y;
     if (c.y > maxY) maxY = c.y;
   }
-  const scale = 8; // canvas pixels per SM cell
+  const scale = 4; // canvas pixels per SM cell; CSS keeps it crisp when zoomed
   const w = (maxX - minX + 1) * scale;
   const h = (maxY - minY + 1) * scale;
   const cv = document.createElement('canvas');
