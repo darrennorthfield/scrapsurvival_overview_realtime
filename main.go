@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ var (
 	positionsMu sync.RWMutex
 	updatedAt   time.Time
 	logsDir     string
+	serverPort  int
 )
 
 var posLineRE = regexp.MustCompile(`SMOVERVIEW_POS:(\[.*\])`)
@@ -46,6 +48,7 @@ func main() {
 	noOpen := flag.Bool("no-open-browser", false, "skip auto-opening the browser")
 	flag.Parse()
 
+	serverPort = *port
 	logsDir = filepath.Join(*smPath, "Logs")
 	if info, err := os.Stat(logsDir); err != nil || !info.IsDir() {
 		fmt.Fprintf(os.Stderr, "Could not find Scrap Mechanic logs directory at:\n  %s\n\nPass --sm-path \"<path-to-Scrap Mechanic>\" if your install is elsewhere.\n", logsDir)
@@ -56,23 +59,56 @@ func main() {
 
 	http.HandleFunc("/positions", handlePositions)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/info", handleInfo)
 	http.HandleFunc("/", handleIndex)
 
+	// Bind to 0.0.0.0 so other machines on the LAN can connect (viewer mode).
+	// Anyone on your network with the URL can see player positions — fine for
+	// the "playing with one friend on the same Wi-Fi" use case.
 	addr := fmt.Sprintf(":%d", *port)
-	url := fmt.Sprintf("http://127.0.0.1:%d", *port)
-	fmt.Printf("sm_overview realtime — serving %s\n", url)
+	localURL := fmt.Sprintf("http://127.0.0.1:%d", *port)
+	fmt.Printf("sm_overview realtime — open %s in your browser\n", localURL)
 	fmt.Printf("tailing logs in %s\n", logsDir)
+	if lanIPs := lanIPv4s(); len(lanIPs) > 0 {
+		fmt.Printf("LAN access for other players in your game:\n")
+		for _, ip := range lanIPs {
+			fmt.Printf("  http://%s:%d\n", ip, *port)
+		}
+	}
 
 	if !*noOpen {
 		go func() {
 			time.Sleep(500 * time.Millisecond)
-			openBrowser(url)
+			openBrowser(localURL)
 		}()
 	}
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// lanIPv4s returns this machine's non-loopback IPv4 addresses (RFC1918 ranges
+// + link-local). One of these is what a friend types into the "Connect to host"
+// field on another PC on the same network.
+func lanIPv4s() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		out = append(out, ip4.String())
+	}
+	return out
 }
 
 // tailLogs continuously follows the newest game-*.log in the Logs directory.
@@ -234,14 +270,26 @@ func handlePositions(w http.ResponseWriter, _ *http.Request) {
 
 	sort.Slice(resp.Players, func(i, j int) bool { return resp.Players[i].ID < resp.Players[j].ID })
 
+	// LAN viewer-mode: allow browsers on other machines to fetch this.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"logsDir":%q}`, logsDir)
+}
+
+func handleInfo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		LANIPs []string `json:"lan_ips"`
+		Port   int      `json:"port"`
+	}{LANIPs: lanIPv4s(), Port: serverPort})
 }
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {
@@ -269,13 +317,24 @@ const indexHTML = `<!doctype html>
   #panel {
     position: fixed; top: 12px; right: 12px; z-index: 1000;
     background: rgba(20,24,29,0.92); padding: 10px 14px; border-radius: 8px;
-    font-size: 13px; min-width: 200px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    font-size: 13px; min-width: 240px; max-width: 280px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
   }
   #panel h1 { margin: 0 0 6px 0; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
   #status { color: #aaa; font-size: 12px; margin-bottom: 6px; }
   #players { font-size: 12px; }
   #players .row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
   #players .dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid #fff; }
+  .sep { height: 1px; background: #333; margin: 10px -14px; }
+  .field { margin-top: 4px; font-size: 11px; color: #aaa; }
+  .field label { display: block; margin-bottom: 3px; }
+  .field input {
+    width: 100%; box-sizing: border-box; background: #0d1117; color: #e4e4e4;
+    border: 1px solid #333; border-radius: 4px; padding: 4px 6px; font: 12px ui-monospace, monospace;
+  }
+  .field input:focus { outline: 1px solid #6cb6ff; border-color: #6cb6ff; }
+  .ip-list { font: 12px ui-monospace, monospace; color: #6cb6ff; line-height: 1.5; }
+  .ip-list .copy { cursor: pointer; user-select: all; }
+  .ip-list .copy:hover { text-decoration: underline; }
   .player-tooltip {
     background: rgba(0,0,0,0.78) !important; color: #fff !important;
     border: none !important; box-shadow: none !important;
@@ -290,6 +349,15 @@ const indexHTML = `<!doctype html>
   <h1>sm_overview realtime</h1>
   <div id="status">connecting…</div>
   <div id="players"></div>
+  <div class="sep"></div>
+  <div class="field">
+    <label>Share with friends on your network:</label>
+    <div id="lan-ips" class="ip-list">…</div>
+  </div>
+  <div class="field" style="margin-top:8px">
+    <label>Connect to host (leave blank for local):</label>
+    <input id="host-input" type="text" placeholder="e.g. 192.168.1.42:7777" autocomplete="off" spellcheck="false">
+  </div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
@@ -356,9 +424,45 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 }
 
+// Host selection: empty string = use this .exe's own /positions; otherwise
+// fetch from http://<that>/positions (your friend's machine on the LAN).
+let host = (localStorage.getItem('sm_overview_host') || '').trim();
+
+function endpoint(path) {
+  if (!host) return path;
+  const h = /^https?:\/\//.test(host) ? host : 'http://' + host;
+  return h.replace(/\/$/, '') + path;
+}
+
+(async function loadInfo() {
+  try {
+    const r = await fetch('/info');
+    const info = await r.json();
+    const ips = (info.lan_ips || []);
+    const port = info.port || 7777;
+    document.getElementById('lan-ips').innerHTML = ips.length === 0
+      ? '<span style="color:#888">(no LAN IPs detected)</span>'
+      : ips.map(ip => '<span class="copy">' + ip + ':' + port + '</span>').join('<br>');
+  } catch (e) { /* ignore */ }
+})();
+
+const hostInput = document.getElementById('host-input');
+hostInput.value = host;
+hostInput.addEventListener('change', () => {
+  host = hostInput.value.trim();
+  localStorage.setItem('sm_overview_host', host);
+  // Wipe markers so we don't keep stale positions from the previous source
+  for (const id of Object.keys(markers)) {
+    map.removeLayer(markers[id]);
+    delete markers[id];
+  }
+  zoomedToInitial = false;
+  refresh();
+});
+
 async function refresh() {
   try {
-    const r = await fetch('/positions');
+    const r = await fetch(endpoint('/positions'));
     const data = await r.json();
     const players = data.players || [];
     renderPanel(players, data.age_seconds || 0);
