@@ -1,24 +1,66 @@
-dofile( "$SURVIVAL_DATA/Scripts/game/survival_shapes.lua" )
-dofile( "$SURVIVAL_DATA/Scripts/game/survival_harvestable.lua" )
-dofile( "$SURVIVAL_DATA/Scripts/game/survival_constants.lua" )
-dofile( "$SURVIVAL_DATA/Scripts/game/managers/ElevatorManager.lua"  )
-dofile( "$SURVIVAL_DATA/Scripts/game/managers/RespawnManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/BeaconManager.lua" )
-dofile( "$SURVIVAL_DATA/Scripts/game/managers/UnitManager.lua" )
+
+
+
+dofile( "$SURVIVAL_DATA/Scripts/game/managers/EffectManager.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/managers/ElevatorManager.lua"  )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/QuestManager.lua" )
-dofile( "$SURVIVAL_DATA/Scripts/game/util/Timer.lua" )
-
+dofile( "$SURVIVAL_DATA/Scripts/game/managers/RespawnManager.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/managers/UnitManager.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_constants.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_harvestable.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_shapes.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/survival_units.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_projectiles.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_meleeattacks.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/util/recipes.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/util/Timer.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/managers/QuestEntityManager.lua" )
+dofile( "$GAME_DATA/Scripts/game/managers/EventManager.lua" )
 
+
+
+
+---@class SurvivalGame : GameClass
+---@field sv table
+---@field cl table
+---@field warehouses table
 SurvivalGame = class( nil )
 SurvivalGame.enableLimitedInventory = true
 SurvivalGame.enableRestrictions = true
 SurvivalGame.enableFuelConsumption = true
 SurvivalGame.enableAmmoConsumption = true
-SurvivalGame.enableUpgradeCost = true
+SurvivalGame.enableUpgrade = true
 
 local SyncInterval = 400 -- 400 ticks | 10 seconds
 
+-- sm_overview realtime: write player positions to JSON every ~1 second
+local PlayerSyncInterval = 40 -- ticks (40 Hz fixed update -> ~1s)
+local g_playerSyncTick = 0
+
+local function writePlayersJson()
+	local allPlayers = sm.player.getAllPlayers()
+	sm.log.warning( "sm_overview: writePlayersJson called, players=" .. tostring( #allPlayers ) )
+	local players = {}
+	for _, player in ipairs( allPlayers ) do
+		local character = player:getCharacter()
+		if character and sm.exists( character ) then
+			local pos = character:getWorldPosition()
+			table.insert( players, {
+				id = player.id,
+				name = player.name,
+				x = pos.x,
+				y = pos.y,
+				z = pos.z,
+			} )
+		end
+	end
+	sm.json.save( { players = players }, "$SURVIVAL_DATA/LocalBlueprints/players.json" )
+end
+
+local IntroFadeDuration = 1.1
+local IntroEndFadeDuration = 1.1
+local IntroFadeTimeout = 5.0
 
 function SurvivalGame.server_onCreate( self )
 	print( "SurvivalGame.server_onCreate" )
@@ -38,14 +80,22 @@ function SurvivalGame.server_onCreate( self )
 	if self.sv.saved.data and self.sv.saved.data.dev then
 		g_godMode = true
 		g_survivalDev = true
+		sm.log.info( "Starting SurvivalGame in DEV mode" )
 	end
 
-	g_survivalDev = true
-
 	self:loadCraftingRecipes()
+	g_enableCollisionTumble = true
+
+	g_eventManager = EventManager()
+	g_eventManager:sv_onCreate()
 
 	g_elevatorManager = ElevatorManager()
 	g_elevatorManager:sv_onCreate()
+
+
+
+
+
 
 	g_respawnManager = RespawnManager()
 	g_respawnManager:sv_onCreate( self.sv.saved.overworld )
@@ -56,24 +106,37 @@ function SurvivalGame.server_onCreate( self )
 	g_unitManager = UnitManager()
 	g_unitManager:sv_onCreate( self.sv.saved.overworld )
 
-	g_questManager = QuestManager()
-	g_questManager:sv_onCreate( self )
-	g_questManager:sv_activateQuest( quest_use_terminal )
+	self.sv.questEntityManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "c6988ecb-0fc1-4d45-afde-dc583b8b75ee" ) )
 
-	if g_survivalDev then
-		g_questManager:sv_completeQuest( quest_pickup_logbook )
+	self.sv.questManager = sm.storage.load( STORAGE_CHANNEL_QUESTMANAGER )
+	if not self.sv.questManager then
+		self.sv.questManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "83b0cc7e-b164-47b8-a83c-0d33ba5f72ec" ) )
+		sm.storage.save( STORAGE_CHANNEL_QUESTMANAGER, self.sv.questManager )
 	end
+
+
+
+
 
 	-- Game script managed global warehouse table
-	self.warehouses = sm.storage.load( STORAGE_CHANNEL_WAREHOUSES )
-	if self.warehouses then
+	self.sv.warehouses = sm.storage.load( STORAGE_CHANNEL_WAREHOUSES )
+	if self.sv.warehouses then
 		print( "Loaded warehouses:" )
-		print( self.warehouses )
+		print( self.sv.warehouses )
 	else
-		self.warehouses = {}
-		self:sv_e_saveWarehouses()
+		self.sv.warehouses = {}
+		sm.storage.save( STORAGE_CHANNEL_WAREHOUSES, self.sv.warehouses )
 	end
-	g_warehouses = self.warehouses
+
+
+
+
+
+
+
+
+
+
 
 
 	self.sv.time = sm.storage.load( STORAGE_CHANNEL_TIME )
@@ -86,11 +149,12 @@ function SurvivalGame.server_onCreate( self )
 		self.sv.time.timeProgress = true
 		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
 	end
+	self.network:setClientData( { dev = g_survivalDev }, 1 )
 	self:sv_updateClientData()
 
 	self.sv.syncTimer = Timer()
 	self.sv.syncTimer:start( 0 )
- end
+end
 
 function SurvivalGame.server_onRefresh( self )
 	g_craftingRecipes = nil
@@ -99,69 +163,16 @@ function SurvivalGame.server_onRefresh( self )
 end
 
 function SurvivalGame.client_onCreate( self )
-	if true then
-		sm.game.bindChatCommand( "/ammo", { { "int", "quantity", true } }, "cl_onChatCommand", "Give ammo (default 50)" )
-		sm.game.bindChatCommand( "/spudgun", {}, "cl_onChatCommand", "Give the spudgun" )
-		sm.game.bindChatCommand( "/gatling", {}, "cl_onChatCommand", "Give the potato gatling gun" )
-		sm.game.bindChatCommand( "/shotgun", {}, "cl_onChatCommand", "Give the fries shotgun" )
-		sm.game.bindChatCommand( "/sunshake", {}, "cl_onChatCommand", "Give 1 sunshake" )
-		sm.game.bindChatCommand( "/baguette", {}, "cl_onChatCommand", "Give 1 revival baguette" )
-		sm.game.bindChatCommand( "/keycard", {}, "cl_onChatCommand", "Give 1 keycard" )
-		sm.game.bindChatCommand( "/powercore", {}, "cl_onChatCommand", "Give 1 powercore" )
-		sm.game.bindChatCommand( "/components", { { "int", "quantity", true } }, "cl_onChatCommand", "Give <quantity> components (default 10)" )
-		sm.game.bindChatCommand( "/glowsticks", { { "int", "quantity", true } }, "cl_onChatCommand", "Give <quantity> components (default 10)" )
-		sm.game.bindChatCommand( "/tumble", { { "bool", "enable", true } }, "cl_onChatCommand", "Set tumble state" )
-		sm.game.bindChatCommand( "/god", {}, "cl_onChatCommand", "Mechanic characters will take no damage" )
-		sm.game.bindChatCommand( "/respawn", {}, "cl_onChatCommand", "Respawn at last bed (or at the crash site)" )
-		sm.game.bindChatCommand( "/encrypt", {}, "cl_onChatCommand", "Restrict interactions in all warehouses" )
-		sm.game.bindChatCommand( "/decrypt", {}, "cl_onChatCommand", "Unrestrict interactions in all warehouses" )
-		sm.game.bindChatCommand( "/limited", {}, "cl_onChatCommand", "Use the limited inventory" )
-		sm.game.bindChatCommand( "/unlimited", {}, "cl_onChatCommand", "Use the unlimited inventory" )
-		sm.game.bindChatCommand( "/ambush", { { "number", "magnitude", true }, { "int", "wave", true } }, "cl_onChatCommand", "Starts a 'random' encounter" )
-		sm.game.bindChatCommand( "/recreate", {}, "cl_onChatCommand", "Recreate world" )
-		sm.game.bindChatCommand( "/timeofday", { { "number", "timeOfDay", true } }, "cl_onChatCommand", "Sets the time of the day as a fraction (0.5=mid day)" )
-		sm.game.bindChatCommand( "/timeprogress", { { "bool", "enabled", true } }, "cl_onChatCommand", "Enables or disables time progress" )
-		sm.game.bindChatCommand( "/day", {}, "cl_onChatCommand", "Disable time progression and set time to daytime" )
-		sm.game.bindChatCommand( "/spawn", { { "string", "unitName", true } }, "cl_onChatCommand", "Spawn a unit: 'woc', 'tapebot', 'totebot', 'haybot'" )
-		sm.game.bindChatCommand( "/harvestable", { { "string", "harvestableName", true } }, "cl_onChatCommand", "Create a harvestable: 'tree', 'stone'" )
-		sm.game.bindChatCommand( "/cleardebug", {}, "cl_onChatCommand", "Clear debug draw objects" )
-		sm.game.bindChatCommand( "/export", { { "string", "name", false } }, "cl_onChatCommand", "Exports blueprint $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
-		sm.game.bindChatCommand( "/import", { { "string", "name", false } }, "cl_onChatCommand", "Imports blueprint $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
-		sm.game.bindChatCommand( "/starterkit", {}, "cl_onChatCommand", "Spawn a starter kit" )
-		sm.game.bindChatCommand( "/mechanicstartkit", {}, "cl_onChatCommand", "Spawn a starter kit for starting at mechanic station" )
-		sm.game.bindChatCommand( "/pipekit", {}, "cl_onChatCommand", "Spawn a pipe kit" )
-		sm.game.bindChatCommand( "/foodkit", {}, "cl_onChatCommand", "Spawn a food kit" )
-		sm.game.bindChatCommand( "/seedkit", {}, "cl_onChatCommand", "Spawn a seed kit" )
-		sm.game.bindChatCommand( "/die", {}, "cl_onChatCommand", "Kill the player" )
-		sm.game.bindChatCommand( "/sethp", { { "number", "hp", false } }, "cl_onChatCommand", "Set player hp value" )
-		sm.game.bindChatCommand( "/setwater", { { "number", "water", false } }, "cl_onChatCommand", "Set player water value" )
-		sm.game.bindChatCommand( "/setfood", { { "number", "food", false } }, "cl_onChatCommand", "Set player food value" )
-		sm.game.bindChatCommand( "/aggroall", {}, "cl_onChatCommand", "All hostile units will be made aware of the player's position" )
-		sm.game.bindChatCommand( "/goto", { { "string", "name", false } }, "cl_onChatCommand", "Teleport to predefined position" )
-		sm.game.bindChatCommand( "/raid", { { "int", "level", false }, { "int", "wave", true }, { "number", "hours", true } }, "cl_onChatCommand", "Start a level <level> raid at player position at wave <wave> in <delay> hours." )
-		sm.game.bindChatCommand( "/stopraid", {}, "cl_onChatCommand", "Cancel all incoming raids" )
-		sm.game.bindChatCommand( "/disableraids", { { "bool", "enabled", false } }, "cl_onChatCommand", "Disable raids if true" )
-		sm.game.bindChatCommand( "/camera", {}, "cl_onChatCommand", "Spawn a SplineCamera tool" )
-
-		sm.game.bindChatCommand( "/printglobals", {}, "cl_onChatCommand", "Print all global lua variables" )
-		sm.game.bindChatCommand( "/clearpathnodes", {}, "cl_onChatCommand", "Clear all path nodes in overworld" )
-		sm.game.bindChatCommand( "/enablepathpotatoes", { { "bool", "enable", true } }, "cl_onChatCommand", "Creates path nodes at potato hits in overworld and links to previous node" )
-
-		sm.game.bindChatCommand( "/activatequest",  { { "string", "uuid", true } }, "cl_onChatCommand", "Activate quest" )
-		sm.game.bindChatCommand( "/completequest",  { { "string", "uuid", true } }, "cl_onChatCommand", "Complete quest" )
-
-		--custom
-		sm.game.bindChatCommand( "/cell", { { "string", "x,y,z", false } }, "cl_onChatCommand", "Teleport to numerical cell position" )
-		sm.game.bindChatCommand( "/tp", { { "string", "x,y,z", false } }, "cl_onChatCommand", "Teleport to numerical position" )
-		sm.game.bindChatCommand( "/dir", { }, "cl_onChatCommand", "Tell you direction vector you are looking at." )
-	end
 
 	self.cl = {}
 	self.cl.time = {}
 	self.cl.time.timeOfDay = 0.0
 	self.cl.time.timeProgress = true
 
-	self:loadCraftingRecipes()
+	if not sm.isHost then
+		self:loadCraftingRecipes()
+		g_enableCollisionTumble = true
+	end
 
 	if g_respawnManager == nil then
 		assert( not sm.isHost )
@@ -181,11 +192,8 @@ function SurvivalGame.client_onCreate( self )
 	end
 	g_unitManager:cl_onCreate()
 
-	if g_questManager == nil then
-		assert( not sm.isHost )
-		g_questManager = QuestManager()
-	end
-	g_questManager:cl_onCreate()
+	g_effectManager = EffectManager()
+	g_effectManager:cl_onCreate()
 
 	-- Music effect
 	g_survivalMusic = sm.effect.createEffect( "SurvivalMusic" )
@@ -196,56 +204,102 @@ function SurvivalGame.client_onCreate( self )
 	assert(g_survivalHud)
 end
 
-function SurvivalGame.client_onClientDataUpdate( self, clientData )
-	self.cl.time = clientData.time
+function SurvivalGame.bindChatCommands( self )
+
+
+
+	local addCheats = g_survivalDev
+
+	if addCheats then
+		sm.game.bindChatCommand( "/ammo", { { "int", "quantity", true } }, "cl_onChatCommand", "Give ammo (default 50)" )
+		sm.game.bindChatCommand( "/spudgun", {}, "cl_onChatCommand", "Give the spudgun" )
+		sm.game.bindChatCommand( "/gatling", {}, "cl_onChatCommand", "Give the potato gatling gun" )
+		sm.game.bindChatCommand( "/shotgun", {}, "cl_onChatCommand", "Give the fries shotgun" )
+		sm.game.bindChatCommand( "/sunshake", {}, "cl_onChatCommand", "Give 1 sunshake" )
+		sm.game.bindChatCommand( "/baguette", {}, "cl_onChatCommand", "Give 1 revival baguette" )
+		sm.game.bindChatCommand( "/keycard", {}, "cl_onChatCommand", "Give 1 keycard" )
+		sm.game.bindChatCommand( "/powercore", {}, "cl_onChatCommand", "Give 1 powercore" )
+		sm.game.bindChatCommand( "/components", { { "int", "quantity", true } }, "cl_onChatCommand", "Give <quantity> components (default 10)" )
+		sm.game.bindChatCommand( "/glowsticks", { { "int", "quantity", true } }, "cl_onChatCommand", "Give <quantity> components (default 10)" )
+		sm.game.bindChatCommand( "/tumble", { { "bool", "enable", true } }, "cl_onChatCommand", "Set tumble state" )
+		sm.game.bindChatCommand( "/god", {}, "cl_onChatCommand", "Mechanic characters will take no damage" )
+		sm.game.bindChatCommand( "/respawn", {}, "cl_onChatCommand", "Respawn at last bed (or at the crash site)" )
+		sm.game.bindChatCommand( "/encrypt", {}, "cl_onChatCommand", "Restrict interactions in all warehouses" )
+		sm.game.bindChatCommand( "/decrypt", {}, "cl_onChatCommand", "Unrestrict interactions in all warehouses" )
+		sm.game.bindChatCommand( "/limited", {}, "cl_onChatCommand", "Use the limited inventory" )
+		sm.game.bindChatCommand( "/unlimited", {}, "cl_onChatCommand", "Use the unlimited inventory" )
+		sm.game.bindChatCommand( "/ambush", { { "number", "magnitude", true }, { "int", "wave", true } }, "cl_onChatCommand", "Starts a 'random' encounter" )
+		--sm.game.bindChatCommand( "/recreate", {}, "cl_onChatCommand", "Recreate world" )
+		sm.game.bindChatCommand( "/timeofday", { { "number", "timeOfDay", true } }, "cl_onChatCommand", "Sets the time of the day as a fraction (0.5=mid day)" )
+		sm.game.bindChatCommand( "/timeprogress", { { "bool", "enabled", true } }, "cl_onChatCommand", "Enables or disables time progress" )
+		sm.game.bindChatCommand( "/day", {}, "cl_onChatCommand", "Disable time progression and set time to daytime" )
+		sm.game.bindChatCommand( "/spawn", { { "string", "unitName", true }, { "int", "amount", true } }, "cl_onChatCommand", "Spawn a unit: 'woc', 'tapebot', 'totebot', 'haybot'" )
+		sm.game.bindChatCommand( "/harvestable", { { "string", "harvestableName", true } }, "cl_onChatCommand", "Create a harvestable: 'tree', 'stone'" )
+		sm.game.bindChatCommand( "/cleardebug", {}, "cl_onChatCommand", "Clear debug draw objects" )
+		sm.game.bindChatCommand( "/import", { { "string", "name", false } }, "cl_onChatCommand", "Imports blueprint $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
+		sm.game.bindChatCommand( "/starterkit", {}, "cl_onChatCommand", "Spawn a starter kit" )
+		sm.game.bindChatCommand( "/mechanicstartkit", {}, "cl_onChatCommand", "Spawn a starter kit for starting at mechanic station" )
+		sm.game.bindChatCommand( "/pipekit", {}, "cl_onChatCommand", "Spawn a pipe kit" )
+		sm.game.bindChatCommand( "/foodkit", {}, "cl_onChatCommand", "Spawn a food kit" )
+		sm.game.bindChatCommand( "/seedkit", {}, "cl_onChatCommand", "Spawn a seed kit" )
+		sm.game.bindChatCommand( "/die", {}, "cl_onChatCommand", "Kill the player" )
+		sm.game.bindChatCommand( "/sethp", { { "number", "hp", false } }, "cl_onChatCommand", "Set player hp value" )
+		sm.game.bindChatCommand( "/setwater", { { "number", "water", false } }, "cl_onChatCommand", "Set player water value" )
+		sm.game.bindChatCommand( "/setfood", { { "number", "food", false } }, "cl_onChatCommand", "Set player food value" )
+		sm.game.bindChatCommand( "/aggroall", {}, "cl_onChatCommand", "All hostile units will be made aware of the player's position" )
+		sm.game.bindChatCommand( "/goto", { { "string", "name", false } }, "cl_onChatCommand", "Teleport to predefined position" )
+		sm.game.bindChatCommand( "/raid", { { "int", "level", false }, { "int", "wave", true }, { "number", "hours", true } }, "cl_onChatCommand", "Start a level <level> raid at player position at wave <wave> in <delay> hours." )
+		sm.game.bindChatCommand( "/stopraid", {}, "cl_onChatCommand", "Cancel all incoming raids" )
+		sm.game.bindChatCommand( "/disableraids", { { "bool", "enabled", false } }, "cl_onChatCommand", "Disable raids if true" )
+		sm.game.bindChatCommand( "/camera", {}, "cl_onChatCommand", "Spawn a SplineCamera tool" )
+		sm.game.bindChatCommand( "/noaggro", { { "bool", "enable", true } }, "cl_onChatCommand", "Toggles the player as a target" )
+		sm.game.bindChatCommand( "/killall", {}, "cl_onChatCommand", "Kills all spawned units" )
+
+		sm.game.bindChatCommand( "/printglobals", {}, "cl_onChatCommand", "Print all global lua variables" )
+		sm.game.bindChatCommand( "/clearpathnodes", {}, "cl_onChatCommand", "Clear all path nodes in overworld" )
+		sm.game.bindChatCommand( "/enablepathpotatoes", { { "bool", "enable", true } }, "cl_onChatCommand", "Creates path nodes at potato hits in overworld and links to previous node" )
+
+		sm.game.bindChatCommand( "/activatequest",  { { "string", "name", true } }, "cl_onChatCommand", "Activate quest" )
+		sm.game.bindChatCommand( "/completequest",  { { "string", "name", true } }, "cl_onChatCommand", "Complete quest" )
+
+		sm.game.bindChatCommand( "/settilebool",  { { "string", "name", false }, { "bool", "value", false } }, "cl_onChatCommand", "Set named tile value at player position as a bool" )
+		sm.game.bindChatCommand( "/settilefloat",  { { "string", "name", false }, { "number", "value", false } }, "cl_onChatCommand", "Set named tile value at player position as a floating point number" )
+		sm.game.bindChatCommand( "/settilestring",  { { "string", "name", false }, { "string", "value", false } }, "cl_onChatCommand", "Set named tile value at player position as a bool" )
+		sm.game.bindChatCommand( "/printtilevalues",  {}, "cl_onChatCommand", "Print all tile values at player position" )
+		sm.game.bindChatCommand( "/reloadcell", {{ "int", "x", true }, { "int", "y", true }}, "cl_onChatCommand", "Reload cells at self or {x,y}" )
+		sm.game.bindChatCommand( "/tutorialstartkit", {}, "cl_onChatCommand", "Spawn a starter kit for building a scrap car" )
+
+
+
+
+
+
+	end
 end
 
-function SurvivalGame.cl_n_questMsg( self, params )
-	g_questManager:cl_handleMsg( params )
+function SurvivalGame.client_onClientDataUpdate( self, clientData, channel )
+	if channel == 2 then
+		self.cl.time = clientData.time
+	elseif channel == 1 then
+		g_survivalDev = clientData.dev
+		self:bindChatCommands()
+	end
 end
+
 
 function SurvivalGame.loadCraftingRecipes( self )
-	-- Preload all crafting recipes
-	if not g_craftingRecipes then
-		local recipePaths = {
-			workbench = "$SURVIVAL_DATA/CraftingRecipes/workbench.json",
-			dispenser = "$SURVIVAL_DATA/CraftingRecipes/dispenser.json",
-			cookbot = "$SURVIVAL_DATA/CraftingRecipes/cookbot.json",
-			craftbot = "$SURVIVAL_DATA/CraftingRecipes/craftbot.json",
-			dressbot = "$SURVIVAL_DATA/CraftingRecipes/dressbot.json"
-		}
-		g_craftingRecipes = {}
-		for name, path in pairs( recipePaths ) do
-			local json = sm.json.open( path )
-			local recipes = {}
-			local recipesByIndex = {}
-			for idx, recipe in ipairs( json ) do
-				
-				recipe.craftTime = math.ceil( recipe.craftTime * 40 ) -- Seconds to ticks
-				for _,ingredient in ipairs( recipe.ingredientList ) do
-					ingredient.itemId = sm.uuid.new( ingredient.itemId ) -- Prepare uuid
-				end
-
-				recipes[recipe.itemId] = recipe
-				recipesByIndex[idx] = recipe
-
-			end
-			-- NOTE(daniel): Wardrobe is using 'recipes' by uuid, crafter is using 'recipesByIndex'
-			g_craftingRecipes[name] = { path = path, recipes = recipes, recipesByIndex = recipesByIndex }
-		end
-	end
-
-	-- Preload refinery recipes
-	if not g_refineryRecipes then
-		g_refineryRecipes = sm.json.open( "$SURVIVAL_DATA/CraftingRecipes/refinery.json" )
-		for _,recipe in pairs( g_refineryRecipes ) do
-			recipe.itemId = sm.uuid.new( recipe.itemId ) -- Prepare uuid
-		end
-	end
+	LoadCraftingRecipes({
+		workbench = "$SURVIVAL_DATA/CraftingRecipes/workbench.json",
+		dispenser = "$SURVIVAL_DATA/CraftingRecipes/dispenser.json",
+		cookbot = "$SURVIVAL_DATA/CraftingRecipes/cookbot.json",
+		craftbot = "$SURVIVAL_DATA/CraftingRecipes/craftbot.json",
+		dressbot = "$SURVIVAL_DATA/CraftingRecipes/dressbot.json"
+	})
 end
 
 function SurvivalGame.server_onFixedUpdate( self, timeStep )
 	-- Update time
+
 	local prevTime = self.sv.time.timeOfDay
 	if self.sv.time.timeProgress then
 		self.sv.time.timeOfDay = self.sv.time.timeOfDay + timeStep / DAYCYCLE_TIME
@@ -277,12 +331,30 @@ function SurvivalGame.server_onFixedUpdate( self, timeStep )
 	end
 
 	g_elevatorManager:sv_onFixedUpdate()
+
+
+
+
+
+
 	g_unitManager:sv_onFixedUpdate()
-	g_questManager:sv_onFixedUpdate()
+	if g_eventManager then
+		g_eventManager:sv_onFixedUpdate()
+	end
+
+	-- sm_overview realtime: throttled player position dump
+	g_playerSyncTick = g_playerSyncTick + 1
+	if g_playerSyncTick >= PlayerSyncInterval then
+		g_playerSyncTick = 0
+		local ok, err = pcall( writePlayersJson )
+		if not ok then
+			sm.log.warning( "sm_overview writePlayersJson failed: " .. tostring( err ) )
+		end
+	end
 end
 
 function SurvivalGame.sv_updateClientData( self )
-	self.network:setClientData( { time = self.sv.time } )
+	self.network:setClientData( { time = self.sv.time }, 2 )
 end
 
 function SurvivalGame.client_onUpdate( self, dt )
@@ -309,11 +381,32 @@ function SurvivalGame.client_onUpdate( self, dt )
 	sm.render.setOutdoorLighting( light )
 end
 
-function SurvivalGame.client_showMessage( self, params )
-	sm.gui.chatMessage( params )
+function SurvivalGame.client_showMessage( self, msg )
+	sm.gui.chatMessage( msg )
 end
 
 function SurvivalGame.cl_onChatCommand( self, params )
+
+	local unitSpawnNames =
+	{
+		woc = unit_woc,
+		tapebot = unit_tapebot,
+		tb = unit_tapebot,
+		redtapebot = unit_tapebot_red,
+		rtb = unit_tapebot_red,
+		totebot = unit_totebot_green,
+		green = unit_totebot_green,
+		t = unit_totebot_green,
+		totered = unit_totebot_red,
+		red = unit_totebot_red,
+		tr = unit_totebot_red,
+		haybot = unit_haybot,
+		h = unit_haybot,
+		worm = unit_worm,
+		farmbot = unit_farmbot,
+		f = unit_farmbot,
+	}
+
 	if params[1] == "/ammo" then
 		self.network:sendToServer( "sv_giveItem", { player = sm.localPlayer.getPlayer(), item = obj_plantables_potato, quantity = ( params[2] or 50 ) } )
 	elseif params[1] == "/spudgun" then
@@ -363,34 +456,26 @@ function SurvivalGame.cl_onChatCommand( self, params )
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid then
 			local spawnParams = {
-				uuid = sm.uuid.new( "00000000-0000-0000-0000-000000000000" ),
+				uuid = sm.uuid.getNil(),
 				world = sm.localPlayer.getPlayer().character:getWorld(),
 				position = rayCastResult.pointWorld,
-				yaw = 0.0
+				yaw = 0.0,
+				amount = 1
 			}
-			if params[2] == "woc" then
-				spawnParams.uuid = unit_woc
-			elseif params[2] == "tapebot" or params[2] == "tb" then
-				spawnParams.uuid = unit_tapebot
-			elseif params[2] == "redtapebot" or params[2] == "rtb" then
-				spawnParams.uuid = unit_tapebot_red
-			elseif params[2] == "totebot" or params[2] == "green" or params[2] == "t" then
-				spawnParams.uuid = unit_totebot_green
-			elseif params[2] == "haybot" or params[2] == "h" then
-				spawnParams.uuid = unit_haybot
-			elseif params[2] == "worm" then
-				spawnParams.uuid = unit_worm
-			elseif params[2] == "farmbot" or params[2] == "f" then
-				spawnParams.uuid = unit_farmbot
-			elseif params[2] then
+			if unitSpawnNames[params[2]] then
+				spawnParams.uuid = unitSpawnNames[params[2]]
+			else
 				spawnParams.uuid = sm.uuid.new( params[2] )
+			end
+			if params[3] then
+				spawnParams.amount = params[3]
 			end
 			self.network:sendToServer( "sv_spawnUnit", spawnParams )
 		end
 	elseif params[1] == "/harvestable" then
 		local character = sm.localPlayer.getPlayer().character
 		if character then
-			local harvestableUuid = sm.uuid.new( "00000000-0000-0000-0000-000000000000" )
+			local harvestableUuid = sm.uuid.getNil()
 			if params[2] == "tree" then
 				harvestableUuid = sm.uuid.new( "c4ea19d3-2469-4059-9f13-3ddb4f7e0b79" )
 			elseif params[2] == "stone" then
@@ -415,15 +500,6 @@ function SurvivalGame.cl_onChatCommand( self, params )
 		end
 	elseif params[1] == "/cleardebug" then
 		sm.debugDraw.clear()
-	elseif params[1] == "/export" then
-		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
-		if rayCastValid and rayCastResult.type == "body" then
-			local importParams = {
-				name = params[2],
-				body = rayCastResult:getBody()
-			}
-			self.network:sendToServer( "sv_exportCreation", importParams )
-		end
 	elseif params[1] == "/import" then
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid then
@@ -434,10 +510,46 @@ function SurvivalGame.cl_onChatCommand( self, params )
 			}
 			self.network:sendToServer( "sv_importCreation", importParams )
 		end
+	elseif params[1] == "/noaggro" then
+		if type( params[2] ) == "boolean" then
+			self.network:sendToServer( "sv_n_switchAggroMode", { aggroMode = not params[2] } )
+		else
+			self.network:sendToServer( "sv_n_switchAggroMode", { aggroMode = not sm.game.getEnableAggro() } )
+		end
+	elseif params[1] == "/reloadcell" then
+		local world = sm.localPlayer.getPlayer():getCharacter():getWorld()
+		local player = sm.localPlayer.getPlayer()
+		local pos = player.character:getWorldPosition();
+		local x = params[2] or math.floor( pos.x / 64 )
+		local y = params[3] or math.floor( pos.y / 64 )
+		self.network:sendToServer( "sv_reloadCell", { x = x, y = y, world = world, player = player } )
 	else
 		self.network:sendToServer( "sv_onChatCommand", params )
 	end
 end
+
+function SurvivalGame.sv_reloadCell( self, params, player )
+	print( "sv_reloadCell Reloading cell at {" .. params.x .. " : " .. params.y .. "}" )
+
+	self.sv.saved.overworld:loadCell( params.x, params.y, player )
+	self.network:sendToClients( "cl_reloadCell", params )
+end
+
+function SurvivalGame.cl_reloadCell( self, params )
+	print( "cl_reloadCell reloading " .. params.x .. " : " .. params.y )
+	for x = -2, 2 do
+		for y = -2, 2 do
+			params.world:reloadCell( params.x+x, params.y+y, "cl_reloadCellTestCallback" )
+		end
+	end
+
+end
+
+function SurvivalGame.cl_reloadCellTestCallback( self, world, x, y, result )
+	print( "cl_reloadCellTestCallback" )
+	print( "result = " .. result )
+end
+
 
 function SurvivalGame.sv_giveItem( self, params )
 	sm.container.beginTransaction()
@@ -445,13 +557,52 @@ function SurvivalGame.sv_giveItem( self, params )
 	sm.container.endTransaction()
 end
 
+function SurvivalGame.cl_n_onJoined( self, params )
+	self.cl.playIntroCinematic = params.newPlayer
+end
+
+function SurvivalGame.client_onLoadingScreenLifted( self )
+	g_effectManager:cl_onLoadingScreenLifted()
+	self.network:sendToServer( "sv_n_loadingScreenLifted" )
+	if self.cl.playIntroCinematic then
+		local callbacks = {}
+		callbacks[#callbacks + 1] = { fn = "cl_onCinematicEvent", params = { cinematicName = "cinematic.survivalstart01" }, ref = self }
+		g_effectManager:cl_playNamedCinematic( "cinematic.survivalstart01", callbacks )
+	end
+end
+
+function SurvivalGame.sv_n_loadingScreenLifted( self, _, player )
+	if not g_survivalDev then
+		QuestManager.Sv_TryActivateQuest( "quest_tutorial" )
+	end
+end
+
+function SurvivalGame.cl_onCinematicEvent( self, eventName, params )
+	local myPlayer = sm.localPlayer.getPlayer()
+	local myCharacter = myPlayer and myPlayer.character or nil
+	if eventName == "survivalstart01.dramatics_standup" then
+		if sm.exists( myCharacter ) then
+			sm.event.sendToCharacter( myCharacter, "cl_e_onEvent", "dramatics_standup" )
+		end
+	elseif eventName == "survivalstart01.fadeout" then
+		sm.event.sendToPlayer( myPlayer, "cl_e_startFadeToBlack", { duration = IntroFadeDuration, timeout = IntroFadeTimeout } )
+	elseif eventName == "survivalstart01.fadein" then
+		sm.event.sendToPlayer( myPlayer, "cl_n_endFadeToBlack", { duration = IntroEndFadeDuration } )
+	end
+end
+
 function SurvivalGame.sv_switchGodMode( self )
 	g_godMode = not g_godMode
 	self.network:sendToClients( "client_showMessage", "GODMODE: " .. ( g_godMode and "On" or "Off" ) )
 end
 
+function SurvivalGame.sv_n_switchAggroMode( self, params )
+	sm.game.setEnableAggro(params.aggroMode )
+	self.network:sendToClients( "client_showMessage", "AGGRO: " .. ( params.aggroMode and "On" or "Off" ) )
+end
+
 function SurvivalGame.sv_enableRestrictions( self, state )
-	sm.game.enableRestrictions( state )
+	sm.game.setEnableRestrictions( state )
 	self.network:sendToClients( "client_showMessage", ( state and "Restricted" or "Unrestricted"  ) )
 end
 
@@ -511,11 +662,6 @@ function SurvivalGame.sv_spawnHarvestable( self, params )
 	sm.event.sendToWorld( params.world, "sv_spawnHarvestable", params )
 end
 
-function SurvivalGame.sv_exportCreation( self, params )
-	local obj = sm.json.parseJsonString( sm.creation.exportToString( params.body ) )
-	sm.json.save( obj, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint" )
-end
-
 function SurvivalGame.sv_importCreation( self, params )
 	sm.creation.importFromFile( params.world, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint", params.position )
 end
@@ -524,6 +670,8 @@ function SurvivalGame.sv_onChatCommand( self, params, player )
 	if params[1] == "/tumble" then
 		if params[2] ~= nil then
 			player.character:setTumbling( params[2] )
+		else
+			player.character:setTumbling( not player.character:isTumbling() )
 		end
 		if player.character:isTumbling() then
 			self.network:sendToClients( "client_showMessage", "Player is tumbling" )
@@ -546,115 +694,35 @@ function SurvivalGame.sv_onChatCommand( self, params, player )
 			pos = player.character:getWorldPosition()
 		elseif params[2] == "start" then
 			pos = START_AREA_SPAWN_POINT
-		elseif params[2] == "hideout" then
-			pos = sm.vec3.new( 32, -1248, 100 )
 		else
 			self.network:sendToClient( player, "client_showMessage", "Unknown place" )
 		end
 		if pos then
 			local cellX, cellY = math.floor( pos.x/64 ), math.floor( pos.y/64 )
+			if not sm.exists( self.sv.saved.overworld ) then
+				sm.world.loadWorld( self.sv.saved.overworld )
+			end
 			self.sv.saved.overworld:loadCell( cellX, cellY, player, "sv_recreatePlayerCharacter", { pos = pos, dir = player.character:getDirection() } )
 		end
 
 	elseif params[1] == "/respawn" then
 		sm.event.sendToPlayer( player, "sv_e_respawn" )
 
-	elseif params[1] == "/printglobals" then
-		print( "Globals:" )
-		for k,_ in pairs(_G) do
-			print( k )
-		end
-
 	elseif params[1] == "/activatequest" then
-		local uuid = params[2]
-		if uuid then
-			g_questManager:sv_activateQuest( uuid )
-		else
-			g_questManager:sv_activateAllQuests()
+		local questName = params[2]
+		if questName then
+			QuestManager.Sv_ActivateQuest( questName )
 		end
 	elseif params[1] == "/completequest" then
-		local uuid = params[2]
-		if uuid then
-			g_questManager:sv_completeQuest( uuid )
-		else
-			g_questManager:sv_completeAllQuests()
+		local questName = params[2]
+		if questName then
+			QuestManager.Sv_CompleteQuest( questName )
 		end
-	elseif params[1] == "/cell" then
-		local pos
-		if params[2] == "here" then
-			pos = player.character:getWorldPosition()
-			local cellX, cellY = math.floor( pos.x/64 ), math.floor( pos.y/64 )
-			print("x:"..cellX.." y:"..cellY)
-			self.network:sendToClient( player, "client_showMessage", "x:"..cellX.." y:"..cellY.." z:"..math.floor(pos.z) )
-			--self.network:sendToClient( player, "client_showMessage", "looking x:"..dir.x.." y:"..dir.y.." z:"..dir.z )
-			return
-		else
-			if params[2] ~= nil then
-				local cellX,cellY,z = params[2]:match("([^,]+),([^,]+),([^,]+)")
-				local x = cellX * 64
-				local y = cellY * 64
-				x = x + 32
-				y = y + 32
-				pos = sm.vec3.new( tonumber(x),tonumber(y),tonumber(z) )
-			else
-				self.network:sendToClient( player, "client_showMessage", "Usage: /tp x,y,z or /tp here to see current coords" )
-			end
-		end
-		if pos then
-			local cellX, cellY = math.floor( pos.x/64 ), math.floor( pos.y/64 )
-			print("x:"..cellX.." y:"..cellY)
-			local dir = player.character:getDirection()
-			dir.x = 0
-			dir.y = 1
-			dir.z = -1
-			self.sv.saved.overworld:loadCell( cellX, cellY, player, "sv_recreatePlayerCharacter", { pos = pos, dir = dir } )
-
-		end
-	elseif params[1] == "/tp" then
-		local pos
-		if params[2] == "here" then
-			pos = player.character:getWorldPosition()
-			local dir = player.character:getDirection()
-			self.network:sendToClient( player, "client_showMessage", "x:"..math.floor(pos.x).." y:"..math.floor(pos.y).." z:"..math.floor(pos.z) )
-			--self.network:sendToClient( player, "client_showMessage", "looking x:"..dir.x.." y:"..dir.y.." z:"..dir.z )
-			return
-		elseif params[2] == "cell" then
-			pos = player.character:getWorldPosition()
-			local cellX, cellY = math.floor( pos.x/64 ), math.floor( pos.y/64 )
-			self.network:sendToClient( player, "client_showMessage", "x:"..cellX.." y:"..cellY )
-			--self.network:sendToClient( player, "client_showMessage", "looking x:"..dir.x.." y:"..dir.y.." z:"..dir.z )
-			return
-		else
-			if params[2] ~= nil then
-				local x,y,z = params[2]:match("([^,]+),([^,]+),([^,]+)")
-				pos = sm.vec3.new( tonumber(x),tonumber(y),tonumber(z) )
-			else
-				self.network:sendToClient( player, "client_showMessage", "Usage: /tp x,y,z or /tp here to see current coords" )
-			end
-		end
-		if pos then
-			local cellX, cellY = math.floor( pos.x/64 ), math.floor( pos.y/64 )
-			print("x:"..cellX.." y:"..cellY)
-			local dir = player.character:getDirection()
-			dir.x = 0
-			dir.y = 1
-			dir.z = -1
-			self.sv.saved.overworld:loadCell( cellX, cellY, player, "sv_recreatePlayerCharacter", { pos = pos, dir = dir } )
-		end
-	elseif params[1] == "/clearpathnodes"
-		or params[1] == "/enablepathpotatoes"
-		or params[1] == "/starterkit"
-		or params[1] == "/mechanicstartkit"
-		or params[1] == "/pipekit"
-		or params[1] == "/foodkit"
-		or params[1] == "/seedkit"
-		or params[1] == "/aggroall"
-		or params[1] == "/raid"
-		or params[1] == "/stopraid"
-		or params[1] == "/disableraids"
-	then
+	else
 		params.player = player
-		sm.event.sendToWorld( player.character:getWorld(), "sv_e_onChatCommand", params )
+		if sm.exists( player.character ) then
+			sm.event.sendToWorld( player.character:getWorld(), "sv_e_onChatCommand", params )
+		end
 	end
 end
 
@@ -684,14 +752,12 @@ function SurvivalGame.server_onPlayerJoined( self, player, newPlayer )
 
 		sm.container.endTransaction()
 
-		local spawnPoint = START_AREA_SPAWN_POINT
-		if g_survivalDev then
-			spawnPoint = SURVIVAL_DEV_SPAWN_POINT
-		end
+		local spawnPoint = g_survivalDev and SURVIVAL_DEV_SPAWN_POINT or START_AREA_SPAWN_POINT
 		if not sm.exists( self.sv.saved.overworld ) then
 			sm.world.loadWorld( self.sv.saved.overworld )
 		end
 		self.sv.saved.overworld:loadCell( math.floor( spawnPoint.x/64 ), math.floor( spawnPoint.y/64 ), player, "sv_createNewPlayer" )
+		self.network:sendToClient( player, "cl_n_onJoined", { newPlayer = newPlayer } )
 	else
 		local inventory = player:getInventory()
 
@@ -706,6 +772,14 @@ function SurvivalGame.server_onPlayerJoined( self, player, newPlayer )
 			sm.container.endTransaction()
 		end
 
+		local tool_lift_creative = sm.uuid.new( "5cc12f03-275e-4c8e-b013-79fc0f913e1b" )
+		local creativeLiftCount = sm.container.totalQuantity( inventory, tool_lift_creative )
+		if creativeLiftCount > 0 then
+			sm.container.beginTransaction()
+			sm.container.spend( inventory, tool_lift_creative, creativeLiftCount )
+			sm.container.endTransaction()
+		end
+
 		local liftCount = sm.container.totalQuantity( inventory, tool_lift )
 		if liftCount == 0 then
 			sm.container.beginTransaction()
@@ -717,19 +791,18 @@ function SurvivalGame.server_onPlayerJoined( self, player, newPlayer )
 			sm.container.endTransaction()
 		end
 	end
+	if player.id > 1 then --Too early for self. Questmanager is not created yet...
+		QuestManager.Sv_OnEvent( QuestEvent.PlayerJoined, { player = player } )
+	end
 	g_unitManager:sv_onPlayerJoined( player )
-	g_questManager:sv_onPlayerJoined( player )
 end
 
 function SurvivalGame.server_onPlayerLeft( self, player )
 	print( player.name, "left the game" )
+	if player.id > 1 then
+		QuestManager.Sv_OnEvent( QuestEvent.PlayerLeft, { player = player } )
+	end
 	g_elevatorManager:sv_onPlayerLeft( player )
-end
-
-function SurvivalGame.sv_e_saveWarehouses( self )
-	sm.storage.save( STORAGE_CHANNEL_WAREHOUSES, self.warehouses )
-	print( "Saved warehouses:" )
-	print( self.warehouses )
 end
 
 function SurvivalGame.sv_e_requestWarehouseRestrictions( self, params )
@@ -739,7 +812,7 @@ function SurvivalGame.sv_e_requestWarehouseRestrictions( self, params )
 	-- Warehouse get
 	local warehouse = nil
 	if params.warehouseIndex then
-		warehouse = self.warehouses[params.warehouseIndex]
+		warehouse = self.sv.warehouses[params.warehouseIndex]
 	end
 	if warehouse then
 		sm.event.sendToWorld( params.world, "server_updateRestrictions", warehouse.restrictions )
@@ -752,7 +825,7 @@ function SurvivalGame.sv_e_setWarehouseRestrictions( self, params )
 	-- Warehouse get
 	local warehouse = nil
 	if params.warehouseIndex then
-		warehouse = self.warehouses[params.warehouseIndex]
+		warehouse = self.sv.warehouses[params.warehouseIndex]
 	end
 
 	if warehouse then
@@ -763,8 +836,8 @@ function SurvivalGame.sv_e_setWarehouseRestrictions( self, params )
 				warehouse.restrictions[newRestrictionSetting.name] = newRestrictionSetting
 			end
 		end
-		self.warehouses[params.warehouseIndex] = warehouse
-		self:sv_e_saveWarehouses()
+		self.sv.warehouses[params.warehouseIndex] = warehouse
+		sm.storage.save( STORAGE_CHANNEL_WAREHOUSES, self.sv.warehouses )
 
 		for i, world in ipairs( warehouse.worlds ) do
 			if sm.exists( world ) then
@@ -781,18 +854,19 @@ function SurvivalGame.sv_e_createElevatorDestination( self, params )
 	-- Warehouse get or create
 	local warehouse
 	if params.warehouseIndex then
-		warehouse = self.warehouses[params.warehouseIndex]
+		warehouse = self.sv.warehouses[params.warehouseIndex]
 	else
 		assert( params.name == "ELEVATOR_ENTRANCE" )
 		warehouse = {}
+		warehouse.test = params.test
 		warehouse.world = params.portal:getWorldA()
 		warehouse.worlds = {}
 		warehouse.exits = params.exits
 		warehouse.maxLevels = params.maxLevels
-		warehouse.index = #self.warehouses + 1
+		warehouse.index = #self.sv.warehouses + 1
 		warehouse.restrictions = { erasable = { name = "erasable", state = false }, connectable = { name = "connectable", state = false } }
-		self.warehouses[#self.warehouses + 1] = warehouse
-		self:sv_e_saveWarehouses()
+		self.sv.warehouses[#self.sv.warehouses + 1] = warehouse
+		sm.storage.save( STORAGE_CHANNEL_WAREHOUSES, self.sv.warehouses )
 	end
 
 
@@ -836,6 +910,9 @@ function SurvivalGame.sv_e_createElevatorDestination( self, params )
 	worldData.level = level
 	worldData.warehouseIndex = warehouse.index
 	worldData.maxLevels = warehouse.maxLevels
+
+
+
 	local world = sm.world.createWorld( "$SURVIVAL_DATA/Scripts/game/worlds/WarehouseWorld.lua", "WarehouseWorld", worldData )
 	print( "Created WarehouseWorld "..world.id )
 
@@ -883,14 +960,11 @@ function SurvivalGame.sv_e_respawn( self, params )
 	if params.player.character and sm.exists( params.player.character ) then
 		g_respawnManager:sv_requestRespawnCharacter( params.player )
 	else
-		local spawnPoint = START_AREA_SPAWN_POINT
-		if g_survivalDev then
-			spawnPoint = SURVIVAL_DEV_SPAWN_POINT
+		local spawnPoint = g_survivalDev and SURVIVAL_DEV_SPAWN_POINT or START_AREA_SPAWN_POINT
+		if not sm.exists( self.sv.saved.overworld ) then
+			sm.world.loadWorld( self.sv.saved.overworld )
 		end
-		if not sm.exists( self.saved.overworld ) then
-			sm.world.loadWorld( self.saved.overworld )
-		end
-		self.saved.overworld:loadCell( math.floor( spawnPoint.x/64 ), math.floor( spawnPoint.y/64 ), params.player, "sv_createNewPlayer" )
+		self.sv.saved.overworld:loadCell( math.floor( spawnPoint.x/64 ), math.floor( spawnPoint.y/64 ), params.player, "sv_createNewPlayer" )
 	end
 end
 
