@@ -64,7 +64,13 @@ func main() {
 	smPath := flag.String("sm-path", defaultSMPath, "Scrap Mechanic install directory")
 	port := flag.Int("port", defaultPort, "HTTP server port")
 	noOpen := flag.Bool("no-open-browser", false, "skip auto-opening the browser")
+	scanTiles := flag.Bool("scan-tiles", false, "inspect .tile files under <sm-path>/Survival/Terrain/Tiles and exit")
 	flag.Parse()
+
+	if *scanTiles {
+		runTileScan(*smPath)
+		return
+	}
 
 	serverPort = *port
 	logsDir = filepath.Join(*smPath, "Logs")
@@ -707,6 +713,124 @@ setInterval(refresh, 1000);
 </body>
 </html>
 `
+
+// runTileScan walks <smPath>/Survival/Terrain/Tiles, reads the first 1 KB of
+// each .tile file, and prints anything that might be a UUID or filename so
+// we can figure out how SM stores the tile UUID. Used once to design the
+// real UUID→biome lookup; not part of normal operation.
+func runTileScan(smPath string) {
+	tilesDir := filepath.Join(smPath, "Survival", "Terrain", "Tiles")
+	info, err := os.Stat(tilesDir)
+	if err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "tiles dir not found: %s\n", tilesDir)
+		os.Exit(1)
+	}
+
+	uuidRE := regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
+	var allFiles []string
+	_ = filepath.Walk(tilesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(path), ".tile") {
+			allFiles = append(allFiles, path)
+		}
+		return nil
+	})
+
+	fmt.Printf("Found %d .tile files under %s\n\n", len(allFiles), tilesDir)
+	if len(allFiles) == 0 {
+		return
+	}
+
+	// Inspect first 8 files in detail
+	for i, path := range allFiles {
+		if i >= 8 {
+			break
+		}
+		rel, _ := filepath.Rel(tilesDir, path)
+		fi, _ := os.Stat(path)
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Printf("=== %s — open error: %v\n\n", rel, err)
+			continue
+		}
+		buf := make([]byte, 1024)
+		n, _ := f.Read(buf)
+		f.Close()
+
+		fmt.Printf("=== %s (%d bytes total, read %d) ===\n", rel, fi.Size(), n)
+
+		hits := uuidRE.FindAll(buf[:n], -1)
+		if len(hits) > 0 {
+			fmt.Printf("  UUID-shaped strings: %d\n", len(hits))
+			for j, h := range hits {
+				if j >= 4 {
+					break
+				}
+				fmt.Printf("    [%d] %s\n", j, string(h))
+			}
+		} else {
+			fmt.Printf("  (no UUID text in first 1KB)\n")
+		}
+
+		// First 64 bytes hex
+		hexLen := 64
+		if n < hexLen {
+			hexLen = n
+		}
+		fmt.Printf("  First %d bytes hex: %x\n", hexLen, buf[:hexLen])
+
+		// Extract printable ASCII runs >= 6 chars (likely strings)
+		printable := extractPrintableStrings(buf[:n], 6)
+		shown := 0
+		for _, s := range printable {
+			if shown >= 6 {
+				break
+			}
+			fmt.Printf("  string: %q\n", s)
+			shown++
+		}
+		fmt.Println()
+	}
+
+	// Also tally by directory so we see the overall layout
+	byDir := make(map[string]int)
+	for _, p := range allFiles {
+		rel, _ := filepath.Rel(tilesDir, p)
+		dir := filepath.Dir(rel)
+		byDir[dir]++
+	}
+	fmt.Println("Files per subdirectory:")
+	keys := make([]string, 0, len(byDir))
+	for k := range byDir {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("  %4d  %s\n", byDir[k], k)
+	}
+}
+
+func extractPrintableStrings(b []byte, minLen int) []string {
+	var out []string
+	var cur []byte
+	for _, c := range b {
+		if c >= 0x20 && c <= 0x7e {
+			cur = append(cur, c)
+		} else {
+			if len(cur) >= minLen {
+				out = append(out, string(cur))
+			}
+			cur = nil
+		}
+	}
+	if len(cur) >= minLen {
+		out = append(out, string(cur))
+	}
+	return out
+}
 
 func openBrowser(url string) {
 	var cmd *exec.Cmd
