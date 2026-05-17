@@ -60,6 +60,12 @@ var (
 	cellsEndRE      = regexp.MustCompile(`SMOVERVIEW_CELLS_END`)
 )
 
+// Tile UUID → biome map, populated once at startup from SM's .tile files.
+var (
+	tileBiome   = make(map[string]string)
+	tileBiomeMu sync.RWMutex
+)
+
 func main() {
 	smPath := flag.String("sm-path", defaultSMPath, "Scrap Mechanic install directory")
 	port := flag.Int("port", defaultPort, "HTTP server port")
@@ -74,6 +80,7 @@ func main() {
 
 	serverPort = *port
 	logsDir = filepath.Join(*smPath, "Logs")
+	go loadTileDatabase(*smPath)
 	if info, err := os.Stat(logsDir); err != nil || !info.IsDir() {
 		fmt.Fprintf(os.Stderr, "Could not find Scrap Mechanic logs directory at:\n  %s\n\nPass --sm-path \"<path-to-Scrap Mechanic>\" if your install is elsewhere.\n", logsDir)
 		os.Exit(1)
@@ -83,6 +90,7 @@ func main() {
 
 	http.HandleFunc("/positions", handlePositions)
 	http.HandleFunc("/cells", handleCells)
+	http.HandleFunc("/tile-info", handleTileInfo)
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/info", handleInfo)
 	http.HandleFunc("/", handleIndex)
@@ -354,6 +362,22 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, `{"ok":true,"logsDir":%q}`, logsDir)
 }
 
+func handleTileInfo(w http.ResponseWriter, _ *http.Request) {
+	tileBiomeMu.RLock()
+	out := make(map[string]string, len(tileBiome))
+	for k, v := range tileBiome {
+		out[k] = v
+	}
+	tileBiomeMu.RUnlock()
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "max-age=300")
+	_ = json.NewEncoder(w).Encode(struct {
+		Count    int               `json:"count"`
+		Tiles    map[string]string `json:"tiles"` // uuid -> biome
+	}{Count: len(out), Tiles: out})
+}
+
 func handleCells(w http.ResponseWriter, _ *http.Request) {
 	cellsMu.RLock()
 	out := struct {
@@ -494,22 +518,36 @@ map.setView([0, 0], -1);
 //
 // Result: a recognisable map even without ground-truth biome info.
 
-// Curated palette ordered from "most common biome" downward. SM stats
-// frequently show LAKE >> MEADOW > FOREST > FIELD > others.
-const TOP_TILE_PALETTE = [
-  '#2c4d6a', // 1 - water/lake (blue)
-  '#3b5a3b', // 2 - meadow (green)
-  '#4a3f2b', // 3 - forest (dark brown-green)
-  '#6f6332', // 4 - field (olive/yellow-green)
-  '#7a6440', // 5 - autumn forest (warm)
-  '#8a8a52', // 6 - desert (tan)
-  '#5a5a5a', // 7 - burnt forest (grey)
-];
+// Curated biome → colour palette. Biome names come from SM's own
+// Survival/Terrain/Tiles/ subdirectory layout (loadTileDatabase on the Go
+// side reads each .tile file's header UUID and pairs it with the parent
+// directory name).
+const BIOME_COLORS = {
+  'lake':             '#2c4d6a',  // water (blue)
+  'forest':           '#2a4530',  // pine forest (dark green)
+  'autumn_forest':    '#7a5532',  // warm brown-orange
+  'burnt_forest':     '#3d3a36',  // charcoal grey
+  'meadow':           '#4d6a3a',  // grass (mid-green)
+  'field':            '#787a3f',  // yellow-green crops
+  'desert':           '#a89060',  // tan sand
+  'roads_and_cliffs': '#6a655a',  // grey-brown
+  'poi':              '#8a4a4a',  // points of interest (warm red)
+  'start_area':       '#7a4a8a',  // distinct purple so we can spot spawn
+  'unknown':          '#3a3a3a',
+};
 
-let tileColorMap = {}; // uuid -> css colour, rebuilt when terrain loads
+let tileBiomeLookup = {}; // uuid -> biome name (fetched from /tile-info)
+
+async function loadTileInfo() {
+  try {
+    const r = await fetch(endpoint('/tile-info'));
+    const data = await r.json();
+    if (data && data.tiles) tileBiomeLookup = data.tiles;
+  } catch (e) { /* tile DB might still be scanning, retry handled by reloadTerrain */ }
+}
 
 function hashColorForTile(uuid) {
-  if (!uuid) return '#262c33';
+  if (!uuid) return BIOME_COLORS.unknown;
   let h = 5381;
   for (let i = 0; i < uuid.length; i++) h = ((h << 5) + h + uuid.charCodeAt(i)) | 0;
   const hue = (Math.abs(h) * 37) % 360;
@@ -517,25 +555,12 @@ function hashColorForTile(uuid) {
   return 'hsl(' + hue + ',26%,' + light + '%)';
 }
 
-function buildTileColors(cellArr) {
-  const freq = {};
-  for (const c of cellArr) {
-    if (!c.t) continue;
-    freq[c.t] = (freq[c.t] || 0) + 1;
-  }
-  const ranked = Object.entries(freq).sort((a, b) => b[1] - a[1]);
-  const map = {};
-  for (let i = 0; i < ranked.length; i++) {
-    map[ranked[i][0]] = i < TOP_TILE_PALETTE.length
-      ? TOP_TILE_PALETTE[i]
-      : hashColorForTile(ranked[i][0]);
-  }
-  return map;
-}
-
 function colorForTile(uuid) {
-  if (!uuid) return '#262c33';
-  return tileColorMap[uuid] || hashColorForTile(uuid);
+  if (!uuid) return BIOME_COLORS.unknown;
+  const biome = tileBiomeLookup[uuid];
+  if (biome && BIOME_COLORS[biome]) return BIOME_COLORS[biome];
+  // Tile UUID not in DB yet (DB still loading, or tile is unknown).
+  return hashColorForTile(uuid);
 }
 
 let terrainOverlay = null;
@@ -543,10 +568,14 @@ let terrainLoadedFor = '';   // host:cellsLoaded snapshot key — avoid re-rende
 
 async function loadTerrain() {
   try {
+    // Refresh the biome lookup first so any newly-loaded tile UUIDs colour right.
+    await loadTileInfo();
     const r = await fetch(endpoint('/cells'));
     const data = await r.json();
     if (!data.loaded || !data.cells || data.cells.length === 0) return;
-    const key = host + '|' + data.seed + '|' + data.count;
+    // Include biome-lookup size in the cache key so we re-render if new biome
+    // data becomes available even when the cells themselves haven't changed.
+    const key = host + '|' + data.seed + '|' + data.count + '|' + Object.keys(tileBiomeLookup).length;
     if (key === terrainLoadedFor) return;
     terrainLoadedFor = key;
     renderTerrain(data.cells);
@@ -554,7 +583,6 @@ async function loadTerrain() {
 }
 
 function renderTerrain(cellArr) {
-  tileColorMap = buildTileColors(cellArr);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const c of cellArr) {
     if (c.x < minX) minX = c.x;
@@ -713,6 +741,101 @@ setInterval(refresh, 1000);
 </body>
 </html>
 `
+
+// loadTileDatabase scans <smPath>/Survival/Terrain/Tiles for .tile files,
+// extracts each tile's UUID from the file header, and stores a UUID → biome
+// (= first subdirectory under Tiles/) mapping. That mapping is what the map UI
+// uses to colour cells with real biome colours instead of hash-based noise.
+//
+// .tile file format (discovered via --scan-tiles):
+//   bytes 0..3:   ASCII "TILE"
+//   bytes 4..7:   version uint32 (LE), seen as 9
+//   bytes 8..23:  16-byte tile UUID, RFC-4122 byte order
+//   bytes 24..:   tile content (we don't parse this)
+func loadTileDatabase(smPath string) {
+	tilesDir := filepath.Join(smPath, "Survival", "Terrain", "Tiles")
+	info, err := os.Stat(tilesDir)
+	if err != nil || !info.IsDir() {
+		log.Printf("tile DB: %s not found, terrain colours will fall back to UUID hash", tilesDir)
+		return
+	}
+	m := make(map[string]string)
+	var skipped int
+	err = filepath.Walk(tilesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(path), ".tile") {
+			return nil
+		}
+		rfc, ms, ok := readTileUUID(path)
+		if !ok {
+			skipped++
+			return nil
+		}
+		// Biome = first subdirectory under Tiles/. e.g. "lake/Lake_64_01.tile" → "lake"
+		rel, _ := filepath.Rel(tilesDir, path)
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		biome := "unknown"
+		if len(parts) >= 2 {
+			biome = parts[0]
+		}
+		m[rfc] = biome
+		m[ms] = biome
+		return nil
+	})
+	if err != nil {
+		log.Printf("tile DB walk: %v", err)
+	}
+	tileBiomeMu.Lock()
+	tileBiome = m
+	tileBiomeMu.Unlock()
+	// len(m) is roughly 2× the file count (RFC + MS layouts per tile); divide for the human-friendly number.
+	log.Printf("tile DB loaded: ~%d tiles, %d biomes (%d skipped)", len(m)/2, countDistinct(m), skipped)
+}
+
+func countDistinct(m map[string]string) int {
+	seen := make(map[string]struct{})
+	for _, v := range m {
+		seen[v] = struct{}{}
+	}
+	return len(seen)
+}
+
+// readTileUUID returns BOTH the RFC-4122 layout and the Microsoft mixed-endian
+// layout of the 16-byte UUID at offset 8 in a .tile file. We populate the
+// biome map under both keys so whichever string format SM produces when it
+// runs tostring(uuid) in our cells dump, one of them will match.
+func readTileUUID(path string) (rfc, ms string, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", false
+	}
+	defer f.Close()
+	var buf [24]byte
+	n, _ := f.Read(buf[:])
+	if n < 24 {
+		return "", "", false
+	}
+	if string(buf[0:4]) != "TILE" {
+		return "", "", false
+	}
+	u := buf[8:24]
+	rfc = fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		u[0], u[1], u[2], u[3],
+		u[4], u[5],
+		u[6], u[7],
+		u[8], u[9],
+		u[10], u[11], u[12], u[13], u[14], u[15])
+	// Microsoft layout: first three fields are stored little-endian, last two as-is.
+	ms = fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		u[3], u[2], u[1], u[0],
+		u[5], u[4],
+		u[7], u[6],
+		u[8], u[9],
+		u[10], u[11], u[12], u[13], u[14], u[15])
+	return rfc, ms, true
+}
 
 // runTileScan walks <smPath>/Survival/Terrain/Tiles, reads the first 1 KB of
 // each .tile file, and prints anything that might be a UUID or filename so
