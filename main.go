@@ -83,6 +83,46 @@ var (
 	tileDBMu sync.RWMutex
 )
 
+// detectSMPath looks for Scrap Mechanic across all Steam library folders by
+// reading Steam's libraryfolders.vdf. Returns the first install it finds, or
+// "" if it can't locate one. The default path is tried first.
+func detectSMPath() string {
+	if dirExists(filepath.Join(defaultSMPath, "Survival", "Logs")) {
+		return defaultSMPath
+	}
+	// libraryfolders.vdf lists every Steam library on the machine.
+	candidateVDFs := []string{
+		`C:\Program Files (x86)\Steam\config\libraryfolders.vdf`,
+		`C:\Program Files\Steam\config\libraryfolders.vdf`,
+	}
+	var vdf []byte
+	for _, p := range candidateVDFs {
+		if b, err := os.ReadFile(p); err == nil {
+			vdf = b
+			break
+		}
+	}
+	if vdf == nil {
+		return ""
+	}
+	// Pull every "path" value out of the VDF (KeyValues format). Paths in the
+	// file are double-backslash-escaped; un-escape them.
+	pathRE := regexp.MustCompile(`"path"\s+"([^"]+)"`)
+	for _, m := range pathRE.FindAllSubmatch(vdf, -1) {
+		lib := strings.ReplaceAll(string(m[1]), `\\`, `\`)
+		candidate := filepath.Join(lib, "steamapps", "common", "Scrap Mechanic")
+		if dirExists(filepath.Join(candidate, "Survival", "Logs")) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func dirExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
+}
+
 func main() {
 	smPath := flag.String("sm-path", defaultSMPath, "Scrap Mechanic install directory")
 	port := flag.Int("port", defaultPort, "HTTP server port")
@@ -104,6 +144,15 @@ func main() {
 	}
 
 	serverPort = *port
+
+	// If the configured path doesn't actually have an SM install, try to find
+	// one in a different Steam library before falling back to viewer-only mode.
+	if !dirExists(filepath.Join(*smPath, "Survival", "Logs")) {
+		if detected := detectSMPath(); detected != "" {
+			fmt.Printf("Found Scrap Mechanic at %s\n", detected)
+			*smPath = detected
+		}
+	}
 	logsDir = filepath.Join(*smPath, "Logs")
 
 	// Detect what mode we can usefully run in. Three scenarios:
