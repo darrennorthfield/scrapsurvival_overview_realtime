@@ -553,8 +553,8 @@ const BIOME_COLORS = {
   'meadow':           '#4d6a3a',  // mid grass green
   'field':            '#9a9f4a',  // crops — yellow-green
   'desert':           '#a89060',  // tan sand
-  'road':             '#b89678',  // dirt road — light tan (stands out against grass)
-  'roads_and_cliffs': '#7d7468',  // generic cliff/road tile — beige-grey
+  'road':             '#e8c89a',  // dirt road — bright tan
+  'roads_and_cliffs': '#c4a878',  // generic road/cliff tile — pale tan (most paths in this category)
   // Landmarks (things you'd navigate to)
   'landmark':         '#c25555',  // POIs/ruins — bright red
   'start_area':       '#a85ac4',  // spawn — vivid purple
@@ -665,9 +665,12 @@ function renderLandmarks(cellArr) {
     });
     // Leaflet CRS.Simple: lat=-y, lng=x
     const m = L.marker([-c.worldY, c.worldX], { icon, interactive: true }).addTo(map);
+    // Permanent labels for medium and large landmarks so you can actually
+    // navigate to a named POI without hovering every dot. Tiny 1-cell things
+    // (kiosks, single ruins) stay hover-only to avoid clutter.
     m.bindTooltip(c.label, {
       direction: 'top', offset: [0, -8], className: 'landmark-tooltip',
-      permanent: c.size >= 16, // always-on labels for big landmarks (RuinCity, Hideout, SiloDistrict)
+      permanent: c.size >= 4,
     });
     landmarkMarkers.push(m);
   }
