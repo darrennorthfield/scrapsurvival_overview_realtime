@@ -1,77 +1,126 @@
-<img src="https://i.imgur.com/orwkU5q.png" style="max-width:75%">
+# sm_overview realtime
 
-# 0.6.6 Update Broke JSON
-Scrap Mechanic's Nov 0.6.6 update broke the JSON export to file method, for a workaround see the github issue with [workaround]. I have emailed the developers about the issue but with the holidays will probably be a while for a response.
+A **live, multiplayer map** for Scrap Mechanic survival mode.
 
-# Introduction
-This quickly outputs the world data of your scrap mechanic save game to a json file for display via leafletJS from pre-screenshotted tiles. Not quite as beautiful as my [older screenshot method], but SOOOOOoooooo much quicker. This method is somewhat future proof as well. New tiles will still be displayed just blank, but updates should only require a new download of the missing tiles images.
+Run a small `.exe` while you play and a browser window shows the world with you and your friends moving on it in real time — your terrain, your POIs (Warehouses, Mechanic Stations, Hideouts, Ruin City, the Crashed Ship, etc.), and where everyone is right now.
 
-# Example
-https://the1killer.github.io/scrapmechanictilemap/
+![screenshot placeholder — drop a real one in later](https://via.placeholder.com/900x500.png?text=sm_overview+realtime)
 
-# INSTRUCTIONS
+This is a fork of [the1killer/sm_overview](https://github.com/the1killer/sm_overview) which generated a one-shot static map. This version:
 
-!!!! BACKUP YOUR SAVE, not responsible for any issues !!!!
+- **streams live player positions** every second
+- **labels POIs by name** on the map (Mechanic Station, Crashed Ship, etc.)
+- **shares over LAN** — your friends can see the same map in their own browser
+- **auto-patches and auto-restores** the game's Lua files so you never have to edit them yourself
+- works with **Scrap Mechanic 0.7.4.778**
 
-1. **Really backup your save!**
-1. Download this repoistory, green "Code" button on the top right, or [Download Link]
-1. Open `terrain_overworld.lua` from the downloaded files.
-1. Copy lines 132-157, `local cells` *...to...* `cells = nil   end`
-1. Open `terrain_overworld.lua` in your game files, e.x. C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic\Survival\Scripts\terrain\terrain_overworld.lua
-1. Paste the lines into the game's terrain_overworld.lua, approx **line 130**, after `CreateCellTileStorageKeys()` within the `Load()` Function.
-1. Replace `tile_database.lua` in your game files with the one from the downloaded files. E.x. C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic\Survival\Scripts\terrain\overworld\tile_database.lua
-1. Load your save game.
-1. Copy **cells.json** from your game files C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic\Survival\ to the **html\assets\json directory** in the downloads.
-1. <u>**If hosting on a webserver**</u>
-    1. Copy all the files under **html/** to your webserver and open index.html and good to go.
-1. <u>**If viewing locally**</u>
-    1. Open **cells.json**, select all text (ctrl-a), copy all text
-    1. Paste text into https://codebeautify.org/jsonminifier and click "minify/compress" then copy the resulting text on the right
-    1. Open **html/index.html**, on line 26 `SMOverviewMap.init();` add two back ticks( ` ) inside the parentheses
-    1. Paste the text from Part 2 inbetween the backticks. becomes `SMOverviewMap.init(`\``[[{......`\``);`
-    1. Open **html/index.html** to view your map
-1. If you wish, remove or comment (--) the added lines in terrain_overworld.lua to improve game loading times
+---
 
+## Quick start
 
-## Some things to note
-- Terrain height not really shown.
-- Game updates will remove the lua changes, requiring you to re-add them
-- How to setup your own free [GitHub website]
-- I think there could be some missing road/cliff tiles as there are many possibilties on how they mesh with eachother. Create an issue with your map seed and I can try to capture them.
+1. **Download** [`smoverview.exe`](https://github.com/darrennorthfield/scrapsurvival_overview_realtime/raw/main/smoverview.exe) (~9 MB).
+2. **Right-click → Run as administrator.** It needs to write to your Steam install directory; this is the one-time UAC prompt.
+   - First launch may trigger Windows SmartScreen ("unrecognised app"). Click **More info → Run anyway**. The binary is unsigned.
+3. Your default browser opens to `http://127.0.0.1:7777` showing an empty dark map.
+4. **Launch Scrap Mechanic, load your Survival save.** Within a couple of seconds the map fills in: terrain, biomes, POI labels, and a coloured dot for your character that updates as you walk.
+5. **When you're done playing, close the smoverview.exe console window** (X button or Ctrl+C). It restores your game files to vanilla automatically — Steam updates and SM patches will never conflict because nothing is left modified between sessions.
 
+That's the whole workflow. No manual file editing. No leftover state.
 
-# Changelog
-- v1.0.0
-    - Initial Release
+---
 
-# Donation
-If you love this project and want to see more features give the developer a cup of coffee!
+## Playing with a friend on your LAN
 
-[![paypal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=7JF52HNLJNHFE&item_name=SM+Overview+Donations&currency_code=USD)
+The Lua hook that emits player positions runs on the **host's** machine (whoever is hosting the Steam game). So the host is the source of truth. The friend who's joined just needs to point their browser at the host.
 
+**On the host's PC:**
+- Run `smoverview.exe` as normal. The panel in the top-right of the map page lists your **LAN IPs** (e.g. `192.168.1.42:7777`). Share one with your friend.
 
-# Tutorial Video
-Thanks to LionHeartBlue Gaming to making a tutorial video. Most people will need **Option 2** listed above and in the video. 
-<br/>
-Remember to enclose the JSON with back ticks **\`**.
-<br/>
-<br/>
-[![Tutorial Video](https://img.youtube.com/vi/OXBzApCRwJA/sddefault.jpg))](https://www.youtube.com/watch?v=OXBzApCRwJA))
+**On the friend's PC:**
+- Also run `smoverview.exe` (they don't need a patched SM — they're only viewing, but installing the .exe is the easiest way to get the map UI).
+- In the top-right panel, paste the host's `IP:port` into the **"Connect to host"** field and hit Tab.
+- Both of you now see the same live map.
 
+Two players on the same Wi-Fi: works out of the box. Over the internet from different houses: not yet supported (would need a relay; tracked as a future improvement).
 
-<br/>
-<br/>
-<br/>
-<br/>
-<br/>
-<a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png" /></a><br />This work is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License</a>.
+---
 
-Scrap Mechanic is property of Axolot Games AB, I have no affiliation with them.
+## What's on the map
 
-[//]: # (Links)
-[AutoHotKey]: https://www.autohotkey.com/
-[GitHub website]: https://pages.github.com/
-[Download Link]: https://github.com/the1killer/sm_overview/archive/main.zip
-[older screenshot method]: https://github.com/the1killer/sm_overview_ahk
-[Donate]: https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=7JF52HNLJNHFE&item_name=SM+Overview+Donations&currency_code=USD
-[workaround]: https://github.com/the1killer/sm_overview/issues/17#issuecomment-1849092063
+| Colour / icon | Meaning |
+|---|---|
+| Blue | Lake / open water |
+| Muted green squares in water | Small islands |
+| Dark green | Pine forest |
+| Brown-orange | Autumn forest |
+| Charcoal | Burnt forest |
+| Mid green | Meadow |
+| Yellow-green | Field / farmland |
+| Tan | Desert |
+| Bright tan paths | Roads |
+| Vivid purple area | Survival start area (your spawn point) |
+| Yellow-green pool | Chemical lake |
+| **Yellow / orange dot** | POI — hover for name, big ones are always labelled |
+| **Coloured circle with name** | Live player |
+
+All terrain colours, POI names and player markers update live as long as smoverview.exe is running.
+
+---
+
+## Behind the scenes
+
+When you start the `.exe`:
+
+1. It backs up two of SM's Lua files (`SurvivalGame.lua` and `terrain_overworld.lua`) to `<file>.smoverview-backup` next to the original.
+2. It overwrites them with patched versions (embedded inside the `.exe`) that emit player positions and terrain cell data to SM's own log file.
+3. It tails SM's log file (`<SM>\Logs\game-*.log`) and serves the parsed data at `http://127.0.0.1:7777`.
+
+When you stop it (Ctrl+C, close console, etc.), it copies each backup back over the patched file and deletes the backup. SM is back to vanilla.
+
+---
+
+## Command-line options
+
+You shouldn't need any of these for normal use.
+
+```
+smoverview.exe [flags]
+
+  --sm-path <path>        Scrap Mechanic install directory
+                          (default: C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic)
+  --port <port>           HTTP server port (default: 7777)
+  --no-open-browser       Don't auto-open the browser at startup
+  --no-patch              Skip automatic Lua patching (advanced — patch manually)
+  --restore               Restore vanilla SM Lua files from backups and exit
+  --scan-tiles            Inspect SM's .tile files (developer diagnostic)
+```
+
+## Troubleshooting
+
+**"This app can't run on your PC"** — wrong CPU architecture or the download came through as an HTML page. Re-download from the [raw URL](https://github.com/darrennorthfield/scrapsurvival_overview_realtime/raw/main/smoverview.exe) directly; the file should be ~9 MB.
+
+**"Could not patch... access denied"** — you're not running as administrator. Right-click `smoverview.exe` → Run as administrator.
+
+**Map page shows 🔴 no data** — Scrap Mechanic isn't running, or you haven't loaded into a Survival save yet, or you're on a different SM mode (Creative/Challenge — only Survival is supported).
+
+**Map is unstyled / colours look like random noise** — the tile database might not have finished scanning yet. Refresh the browser tab after a few seconds. (Look for "tile DB loaded: ~351 tiles" in the .exe's console window.)
+
+**Smoverview crashed and left my SM modified** — run `smoverview.exe --restore`. It'll detect the leftover backup files and put vanilla back.
+
+**Scrap Mechanic updated and now something's broken** — the patches embedded in the .exe are version-specific. If SM ships an incompatible update, the .exe may stop working until a new build is released here. Run `smoverview.exe --restore` to clean up.
+
+## Known limitations
+
+- **SM version coupling.** The embedded Lua patches assume Scrap Mechanic 0.7.4.778. A future SM update may require a corresponding update to this tool.
+- **Host-only data.** Player positions are emitted by the host's game. If your friend hosts and only you run smoverview.exe, you see nothing — they need to host it for both of you to see the map. (Workaround: have whoever's running smoverview also be the host.)
+- **No internet multiplayer yet.** LAN works; over-the-internet needs a relay server, which is on the roadmap.
+- **Unsigned binary.** SmartScreen will warn on first launch. We don't currently ship a code-signing certificate.
+
+## Credits
+
+- Original [sm_overview](https://github.com/the1killer/sm_overview) by [the1killer](https://github.com/the1killer) — the basis for terrain dumping and the Leaflet rendering approach.
+- Scrap Mechanic is property of Axolot Games AB. This project has no affiliation with them.
+
+## Licence
+
+This work is licensed under a [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-nc-sa/4.0/), matching the upstream project.
