@@ -523,17 +523,24 @@ map.setView([0, 0], -1);
 // side reads each .tile file's header UUID and pairs it with the parent
 // directory name).
 const BIOME_COLORS = {
-  'lake':             '#2c4d6a',  // water (blue)
-  'forest':           '#2a4530',  // pine forest (dark green)
+  // Terrain biomes
+  'lake':             '#2c4d6a',  // open water — blue
+  'island':           '#5a7a55',  // small island poking out of lake — muted green
+  'chemical_lake':    '#5a6a2c',  // acid pool — sickly yellow-green
+  'forest':           '#2a4530',  // pine forest — dark green
   'autumn_forest':    '#7a5532',  // warm brown-orange
   'burnt_forest':     '#3d3a36',  // charcoal grey
-  'meadow':           '#4d6a3a',  // grass (mid-green)
-  'field':            '#787a3f',  // yellow-green crops
+  'meadow':           '#4d6a3a',  // mid grass green
+  'field':            '#9a9f4a',  // crops — yellow-green
   'desert':           '#a89060',  // tan sand
-  'roads_and_cliffs': '#6a655a',  // grey-brown
-  'poi':              '#8a4a4a',  // points of interest (warm red)
-  'start_area':       '#7a4a8a',  // distinct purple so we can spot spawn
+  'road':             '#b89678',  // dirt road — light tan (stands out against grass)
+  'roads_and_cliffs': '#7d7468',  // generic cliff/road tile — beige-grey
+  // Landmarks (things you'd navigate to)
+  'landmark':         '#c25555',  // POIs/ruins — bright red
+  'start_area':       '#a85ac4',  // spawn — vivid purple
+  // Fallback
   'unknown':          '#3a3a3a',
+  'poi':              '#c25555',  // legacy key — same as landmark
 };
 
 let tileBiomeLookup = {}; // uuid -> biome name (fetched from /tile-info)
@@ -773,13 +780,8 @@ func loadTileDatabase(smPath string) {
 			skipped++
 			return nil
 		}
-		// Biome = first subdirectory under Tiles/. e.g. "lake/Lake_64_01.tile" → "lake"
 		rel, _ := filepath.Rel(tilesDir, path)
-		parts := strings.Split(filepath.ToSlash(rel), "/")
-		biome := "unknown"
-		if len(parts) >= 2 {
-			biome = parts[0]
-		}
+		biome := classifyTile(rel)
 		m[rfc] = biome
 		m[ms] = biome
 		return nil
@@ -806,6 +808,50 @@ func countDistinct(m map[string]string) int {
 // layout of the 16-byte UUID at offset 8 in a .tile file. We populate the
 // biome map under both keys so whichever string format SM produces when it
 // runs tostring(uuid) in our cells dump, one of them will match.
+// classifyTile maps a Tiles-relative path to a biome label used by the UI.
+// The base biome is the top-level subdirectory (lake/, forest/, meadow/, …).
+// Files under poi/ are heterogeneous though — they include both scenic biome
+// fillers (Random_Lake_*, Random_Island_*, Random_Forest_*, Random_Meadow_*,
+// Random_Road_*) and actual man-made landmarks (Ruin_*, Kiosk_*, Warehouse_*,
+// CrashedShip_*, Hideout_*, MechanicStation_*, etc.). Splitting them keeps
+// the "red" landmark colour reserved for things you'd actually navigate to.
+func classifyTile(relPath string) string {
+	rel := filepath.ToSlash(relPath)
+	parts := strings.Split(rel, "/")
+	if len(parts) < 2 {
+		return "unknown"
+	}
+	dir := parts[0]
+	if dir != "poi" {
+		return dir
+	}
+	// poi/<filename>.tile — classify by filename prefix.
+	name := parts[len(parts)-1]
+	name = strings.TrimSuffix(name, ".tile")
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasPrefix(lower, "random_lake"):
+		return "lake"
+	case strings.HasPrefix(lower, "random_island"):
+		return "island"
+	case strings.HasPrefix(lower, "random_forest"):
+		return "forest"
+	case strings.HasPrefix(lower, "random_meadow"):
+		return "meadow"
+	case strings.HasPrefix(lower, "random_road"):
+		return "road"
+	case strings.HasPrefix(lower, "chemicallake"):
+		return "chemical_lake"
+	case strings.HasPrefix(lower, "farmingpatch"):
+		return "field"
+	}
+	// Everything else under poi/ is a real landmark (Ruin, Kiosk, Warehouse,
+	// CrashedShip, Hideout, MechanicStation, PackingStation, CampingSpot,
+	// SiloDistrict, RuinCity, SleepCapsuleBurial, FarmbotGraveyard,
+	// HayBaleLabyrinth, …).
+	return "landmark"
+}
+
 func readTileUUID(path string) (rfc, ms string, ok bool) {
 	f, err := os.Open(path)
 	if err != nil {
