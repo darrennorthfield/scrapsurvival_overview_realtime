@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,14 +12,22 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+//go:embed SurvivalGame.lua
+var patchedSurvivalGameLua []byte
+
+//go:embed terrain_overworld.lua
+var patchedTerrainLua []byte
 
 const (
 	defaultSMPath = `C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic`
@@ -78,16 +88,47 @@ func main() {
 	port := flag.Int("port", defaultPort, "HTTP server port")
 	noOpen := flag.Bool("no-open-browser", false, "skip auto-opening the browser")
 	scanTiles := flag.Bool("scan-tiles", false, "inspect .tile files under <sm-path>/Survival/Terrain/Tiles and exit")
+	noPatch := flag.Bool("no-patch", false, "skip automatic patch/restore of SM Lua files (advanced)")
+	restoreOnly := flag.Bool("restore", false, "restore vanilla SM Lua files from backups and exit")
 	flag.Parse()
 
 	if *scanTiles {
 		runTileScan(*smPath)
 		return
 	}
+	if *restoreOnly {
+		fmt.Println("Restoring vanilla Scrap Mechanic Lua files...")
+		restoreAllPatches(*smPath)
+		fmt.Println("Done.")
+		return
+	}
 
 	serverPort = *port
 	logsDir = filepath.Join(*smPath, "Logs")
 	go loadTileDatabase(*smPath)
+
+	// Apply patches and arrange for the vanilla files to be restored on any
+	// exit path — signal handlers for Ctrl+C / window close / SIGTERM, plus a
+	// defer that catches normal returns and panics (when paired with recover).
+	if !*noPatch {
+		if err := applyAllPatches(*smPath); err != nil {
+			fmt.Fprintf(os.Stderr, "\nCould not patch Scrap Mechanic Lua files:\n  %v\n\n", err)
+			fmt.Fprintln(os.Stderr, "If this looks like a permissions error, right-click smoverview.exe and choose 'Run as administrator'.")
+			fmt.Fprintln(os.Stderr, "If you'd rather patch manually, re-run with --no-patch.")
+			os.Exit(1)
+		}
+		defer restoreAllPatches(*smPath)
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			fmt.Println("\nshutting down — restoring vanilla files...")
+			restoreAllPatches(*smPath)
+			fmt.Println("done.")
+			os.Exit(0)
+		}()
+	}
 	if info, err := os.Stat(logsDir); err != nil || !info.IsDir() {
 		fmt.Fprintf(os.Stderr, "Could not find Scrap Mechanic logs directory at:\n  %s\n\nPass --sm-path \"<path-to-Scrap Mechanic>\" if your install is elsewhere.\n", logsDir)
 		os.Exit(1)
@@ -996,6 +1037,111 @@ func readTileUUID(path string) (rfc, ms string, ok bool) {
 		u[8], u[9],
 		u[10], u[11], u[12], u[13], u[14], u[15])
 	return rfc, ms, true
+}
+
+// --- Patch / restore engine ------------------------------------------------
+//
+// On startup we back up the user's vanilla Lua files, write our patched
+// versions over them, and register a deferred restore so the originals come
+// back when the .exe exits. SM stays in a clean state any time we're not
+// actively running.
+
+type Patch struct {
+	Name        string // for logs
+	RelGamePath string // relative to <sm-path>
+	Data        []byte // patched file content embedded in the .exe
+	Marker      string // unique substring proving a file is already our patched version
+}
+
+var allPatches = []Patch{
+	{
+		Name:        "SurvivalGame.lua",
+		RelGamePath: filepath.Join("Survival", "Scripts", "game", "SurvivalGame.lua"),
+		Data:        patchedSurvivalGameLua,
+		Marker:      "SMOVERVIEW_POS",
+	},
+	{
+		Name:        "terrain_overworld.lua",
+		RelGamePath: filepath.Join("Survival", "Scripts", "terrain", "terrain_overworld.lua"),
+		Data:        patchedTerrainLua,
+		Marker:      "SMOVERVIEW_CELLS_BEGIN",
+	},
+}
+
+func backupPathFor(gameFile string) string {
+	return gameFile + ".smoverview-backup"
+}
+
+func applyAllPatches(smPath string) error {
+	for _, p := range allPatches {
+		if err := applyOnePatch(smPath, p); err != nil {
+			return fmt.Errorf("%s: %w", p.Name, err)
+		}
+	}
+	return nil
+}
+
+func applyOnePatch(smPath string, p Patch) error {
+	gameFile := filepath.Join(smPath, p.RelGamePath)
+	backupFile := backupPathFor(gameFile)
+
+	current, err := os.ReadFile(gameFile)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", gameFile, err)
+	}
+	if bytes.Contains(current, []byte(p.Marker)) {
+		// Already our patched version — likely a crash on the previous run left
+		// it that way. Don't double-patch; don't touch the (possibly missing)
+		// backup either.
+		if _, err := os.Stat(backupFile); err == nil {
+			log.Printf("patch: %s already patched from previous session", p.Name)
+		} else {
+			log.Printf("patch: %s already patched but no backup found — leaving it; restore on exit will be a no-op", p.Name)
+		}
+		return nil
+	}
+
+	// Fresh vanilla file. Back it up first, then write the patched version.
+	if err := os.WriteFile(backupFile, current, 0o644); err != nil {
+		return fmt.Errorf("write backup %s: %w (try running as administrator)", backupFile, err)
+	}
+	if err := os.WriteFile(gameFile, p.Data, 0o644); err != nil {
+		// Try to undo the backup-write if patch-write failed.
+		_ = os.Remove(backupFile)
+		return fmt.Errorf("write patched %s: %w (try running as administrator)", gameFile, err)
+	}
+	log.Printf("patch: %s patched (backup: %s)", p.Name, filepath.Base(backupFile))
+	return nil
+}
+
+func restoreAllPatches(smPath string) {
+	for _, p := range allPatches {
+		if err := restoreOnePatch(smPath, p); err != nil {
+			log.Printf("restore: %s: %v", p.Name, err)
+		}
+	}
+}
+
+func restoreOnePatch(smPath string, p Patch) error {
+	gameFile := filepath.Join(smPath, p.RelGamePath)
+	backupFile := backupPathFor(gameFile)
+
+	data, err := os.ReadFile(backupFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to restore — was already vanilla, or user is starting cleanly
+		}
+		return err
+	}
+	if err := os.WriteFile(gameFile, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Remove(backupFile); err != nil {
+		log.Printf("restore: %s restored but backup not removed: %v", p.Name, err)
+	} else {
+		log.Printf("restore: %s back to vanilla", p.Name)
+	}
+	return nil
 }
 
 // runTileScan walks <smPath>/Survival/Terrain/Tiles, reads the first 1 KB of
