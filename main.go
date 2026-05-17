@@ -60,10 +60,17 @@ var (
 	cellsEndRE      = regexp.MustCompile(`SMOVERVIEW_CELLS_END`)
 )
 
-// Tile UUID → biome map, populated once at startup from SM's .tile files.
+// Tile UUID → biome / human label, populated once at startup from SM's .tile
+// files. Label is only populated for landmark POIs (so the UI knows which to
+// show as named markers); biome alone is enough to colour the cell.
+type TileInfo struct {
+	Biome string `json:"biome"`
+	Label string `json:"label,omitempty"`
+}
+
 var (
-	tileBiome   = make(map[string]string)
-	tileBiomeMu sync.RWMutex
+	tileDB   = make(map[string]TileInfo)
+	tileDBMu sync.RWMutex
 )
 
 func main() {
@@ -363,18 +370,18 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func handleTileInfo(w http.ResponseWriter, _ *http.Request) {
-	tileBiomeMu.RLock()
-	out := make(map[string]string, len(tileBiome))
-	for k, v := range tileBiome {
+	tileDBMu.RLock()
+	out := make(map[string]TileInfo, len(tileDB))
+	for k, v := range tileDB {
 		out[k] = v
 	}
-	tileBiomeMu.RUnlock()
+	tileDBMu.RUnlock()
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "max-age=300")
 	_ = json.NewEncoder(w).Encode(struct {
-		Count    int               `json:"count"`
-		Tiles    map[string]string `json:"tiles"` // uuid -> biome
+		Count int                 `json:"count"`
+		Tiles map[string]TileInfo `json:"tiles"`
 	}{Count: len(out), Tiles: out})
 }
 
@@ -462,6 +469,19 @@ const indexHTML = `<!doctype html>
     font: 11px ui-monospace, monospace !important; padding: 2px 6px !important;
   }
   .player-tooltip::before { display: none !important; }
+  .landmark-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #ffd966; border: 2px solid #2a1a08;
+    box-shadow: 0 0 4px rgba(0,0,0,0.6);
+  }
+  .landmark-md .landmark-dot { width: 14px; height: 14px; }
+  .landmark-lg .landmark-dot { width: 18px; height: 18px; background: #ff9b4a; }
+  .landmark-tooltip {
+    background: rgba(20,10,0,0.92) !important; color: #ffe599 !important;
+    border: 1px solid #44331a !important; box-shadow: none !important;
+    font: 11px ui-monospace, monospace !important; padding: 2px 6px !important;
+  }
+  .landmark-tooltip::before { display: none !important; }
 </style>
 </head>
 <body>
@@ -564,14 +584,94 @@ function hashColorForTile(uuid) {
 
 function colorForTile(uuid) {
   if (!uuid) return BIOME_COLORS.unknown;
-  const biome = tileBiomeLookup[uuid];
-  if (biome && BIOME_COLORS[biome]) return BIOME_COLORS[biome];
+  const info = tileBiomeLookup[uuid];
+  if (info && info.biome && BIOME_COLORS[info.biome]) return BIOME_COLORS[info.biome];
   // Tile UUID not in DB yet (DB still loading, or tile is unknown).
   return hashColorForTile(uuid);
 }
 
+function labelForTile(uuid) {
+  const info = tileBiomeLookup[uuid];
+  return info && info.label ? info.label : null;
+}
+
 let terrainOverlay = null;
 let terrainLoadedFor = '';   // host:cellsLoaded snapshot key — avoid re-rendering identical data
+let landmarkMarkers = [];    // L.marker[]  — one per detected landmark cluster
+
+function clearLandmarkMarkers() {
+  for (const m of landmarkMarkers) map.removeLayer(m);
+  landmarkMarkers = [];
+}
+
+// clusterLandmarks groups labeled cells by tile UUID, then finds contiguous
+// (8-connected) clusters within each group so a 4x4 RuinCity gets one marker
+// instead of 16. Returns one entry per cluster with its world-space center.
+function clusterLandmarks(cellArr) {
+  const byUuid = new Map();
+  for (const c of cellArr) {
+    const label = labelForTile(c.t);
+    if (!label) continue;
+    if (!byUuid.has(c.t)) byUuid.set(c.t, []);
+    byUuid.get(c.t).push(c);
+  }
+  const clusters = [];
+  for (const [uuid, group] of byUuid) {
+    const label = tileBiomeLookup[uuid].label;
+    const cellMap = new Map();
+    for (const c of group) cellMap.set(c.x + ',' + c.y, c);
+    const visited = new Set();
+    for (const c of group) {
+      const key = c.x + ',' + c.y;
+      if (visited.has(key)) continue;
+      const stack = [c];
+      const component = [];
+      while (stack.length) {
+        const cur = stack.pop();
+        const ck = cur.x + ',' + cur.y;
+        if (visited.has(ck)) continue;
+        visited.add(ck);
+        component.push(cur);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            if (dx === 0 && dy === 0) continue;
+            const nk = (cur.x + dx) + ',' + (cur.y + dy);
+            if (!visited.has(nk) && cellMap.has(nk)) stack.push(cellMap.get(nk));
+          }
+        }
+      }
+      let cx = 0, cy = 0;
+      for (const p of component) { cx += p.x; cy += p.y; }
+      cx = cx / component.length + 0.5; // +0.5 to land on the cell center
+      cy = cy / component.length + 0.5;
+      clusters.push({
+        worldX: cx * 64, worldY: cy * 64,
+        label, size: component.length,
+      });
+    }
+  }
+  return clusters;
+}
+
+function renderLandmarks(cellArr) {
+  clearLandmarkMarkers();
+  const clusters = clusterLandmarks(cellArr);
+  for (const c of clusters) {
+    const klass = c.size >= 16 ? 'landmark-lg' : (c.size >= 4 ? 'landmark-md' : '');
+    const icon = L.divIcon({
+      className: klass,
+      html: '<div class="landmark-dot"></div>',
+      iconSize: [18, 18], iconAnchor: [9, 9],
+    });
+    // Leaflet CRS.Simple: lat=-y, lng=x
+    const m = L.marker([-c.worldY, c.worldX], { icon, interactive: true }).addTo(map);
+    m.bindTooltip(c.label, {
+      direction: 'top', offset: [0, -8], className: 'landmark-tooltip',
+      permanent: c.size >= 16, // always-on labels for big landmarks (RuinCity, Hideout, SiloDistrict)
+    });
+    landmarkMarkers.push(m);
+  }
+}
 
 async function loadTerrain() {
   try {
@@ -623,6 +723,8 @@ function renderTerrain(cellArr) {
     opacity: 0.85, interactive: false,
   }).addTo(map);
   terrainOverlay.bringToBack();
+
+  renderLandmarks(cellArr);
 }
 
 loadTerrain();
@@ -702,6 +804,7 @@ hostInput.addEventListener('change', () => {
     delete markers[id];
   }
   if (terrainOverlay) { map.removeLayer(terrainOverlay); terrainOverlay = null; }
+  clearLandmarkMarkers();
   terrainLoadedFor = '';
   zoomedToInitial = false;
   refresh();
@@ -766,7 +869,7 @@ func loadTileDatabase(smPath string) {
 		log.Printf("tile DB: %s not found, terrain colours will fall back to UUID hash", tilesDir)
 		return
 	}
-	m := make(map[string]string)
+	m := make(map[string]TileInfo)
 	var skipped int
 	err = filepath.Walk(tilesDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -781,25 +884,25 @@ func loadTileDatabase(smPath string) {
 			return nil
 		}
 		rel, _ := filepath.Rel(tilesDir, path)
-		biome := classifyTile(rel)
-		m[rfc] = biome
-		m[ms] = biome
+		tinfo := classifyTile(rel)
+		m[rfc] = tinfo
+		m[ms] = tinfo
 		return nil
 	})
 	if err != nil {
 		log.Printf("tile DB walk: %v", err)
 	}
-	tileBiomeMu.Lock()
-	tileBiome = m
-	tileBiomeMu.Unlock()
-	// len(m) is roughly 2× the file count (RFC + MS layouts per tile); divide for the human-friendly number.
-	log.Printf("tile DB loaded: ~%d tiles, %d biomes (%d skipped)", len(m)/2, countDistinct(m), skipped)
+	tileDBMu.Lock()
+	tileDB = m
+	tileDBMu.Unlock()
+	// len(m) is ~2× the file count (RFC + MS layouts per tile); divide for the human-friendly number.
+	log.Printf("tile DB loaded: ~%d tiles, %d biomes (%d skipped)", len(m)/2, countDistinctBiomes(m), skipped)
 }
 
-func countDistinct(m map[string]string) int {
+func countDistinctBiomes(m map[string]TileInfo) int {
 	seen := make(map[string]struct{})
 	for _, v := range m {
-		seen[v] = struct{}{}
+		seen[v.Biome] = struct{}{}
 	}
 	return len(seen)
 }
@@ -815,41 +918,50 @@ func countDistinct(m map[string]string) int {
 // Random_Road_*) and actual man-made landmarks (Ruin_*, Kiosk_*, Warehouse_*,
 // CrashedShip_*, Hideout_*, MechanicStation_*, etc.). Splitting them keeps
 // the "red" landmark colour reserved for things you'd actually navigate to.
-func classifyTile(relPath string) string {
+func classifyTile(relPath string) TileInfo {
 	rel := filepath.ToSlash(relPath)
 	parts := strings.Split(rel, "/")
 	if len(parts) < 2 {
-		return "unknown"
+		return TileInfo{Biome: "unknown"}
 	}
 	dir := parts[0]
+	name := strings.TrimSuffix(parts[len(parts)-1], ".tile")
 	if dir != "poi" {
-		return dir
+		return TileInfo{Biome: dir}
 	}
-	// poi/<filename>.tile — classify by filename prefix.
-	name := parts[len(parts)-1]
-	name = strings.TrimSuffix(name, ".tile")
 	lower := strings.ToLower(name)
 	switch {
 	case strings.HasPrefix(lower, "random_lake"):
-		return "lake"
+		return TileInfo{Biome: "lake"}
 	case strings.HasPrefix(lower, "random_island"):
-		return "island"
+		return TileInfo{Biome: "island"}
 	case strings.HasPrefix(lower, "random_forest"):
-		return "forest"
+		return TileInfo{Biome: "forest"}
 	case strings.HasPrefix(lower, "random_meadow"):
-		return "meadow"
+		return TileInfo{Biome: "meadow"}
 	case strings.HasPrefix(lower, "random_road"):
-		return "road"
+		return TileInfo{Biome: "road"}
 	case strings.HasPrefix(lower, "chemicallake"):
-		return "chemical_lake"
+		return TileInfo{Biome: "chemical_lake", Label: "Chemical Lake"}
 	case strings.HasPrefix(lower, "farmingpatch"):
-		return "field"
+		return TileInfo{Biome: "field"}
 	}
-	// Everything else under poi/ is a real landmark (Ruin, Kiosk, Warehouse,
-	// CrashedShip, Hideout, MechanicStation, PackingStation, CampingSpot,
-	// SiloDistrict, RuinCity, SleepCapsuleBurial, FarmbotGraveyard,
-	// HayBaleLabyrinth, …).
-	return "landmark"
+	// Actual landmark — humanize for the map label.
+	return TileInfo{Biome: "landmark", Label: humanizeLandmark(name)}
+}
+
+// humanizeLandmark turns "MechanicStation_128_01" into "Mechanic Station",
+// "Warehouse_Exterior_3Floors_256_01" into "Warehouse Exterior 3Floors", etc.
+var (
+	tileSizeSuffixRE = regexp.MustCompile(`_\d+(_\d+)?$`)
+	camelCaseRE      = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+)
+
+func humanizeLandmark(name string) string {
+	name = tileSizeSuffixRE.ReplaceAllString(name, "")
+	name = strings.ReplaceAll(name, "_", " ")
+	name = camelCaseRE.ReplaceAllString(name, "$1 $2")
+	return name
 }
 
 func readTileUUID(path string) (rfc, ms string, ok bool) {
