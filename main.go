@@ -105,20 +105,46 @@ func main() {
 
 	serverPort = *port
 	logsDir = filepath.Join(*smPath, "Logs")
-	go loadTileDatabase(*smPath)
 
-	// Apply patches and arrange for the vanilla files to be restored on any
-	// exit path — signal handlers for Ctrl+C / window close / SIGTERM, plus a
-	// defer that catches normal returns and panics (when paired with recover).
-	if !*noPatch {
+	// Detect what mode we can usefully run in. Three scenarios:
+	//   1. Host: SM installed at smPath AND we can write to its Lua files.
+	//      → patch on start, tail logs, restore on exit.
+	//   2. Local viewer: SM installed but we can't / shouldn't patch.
+	//      → no patch, no tail, still serve the map UI.
+	//   3. Pure viewer: SM not at this path at all (friend who's just
+	//      watching the host's data over LAN).
+	//      → no patch, no tail, still serve the map UI.
+	smPresent := false
+	if info, err := os.Stat(logsDir); err == nil && info.IsDir() {
+		smPresent = true
+	}
+
+	if smPresent {
+		go loadTileDatabase(*smPath)
+		go tailLogs()
+	} else {
+		fmt.Printf("Scrap Mechanic not found at %s — running in viewer-only mode.\n", *smPath)
+		fmt.Println("  (Use the 'Connect to host' field in the browser to point at someone else's LAN IP.)")
+	}
+
+	// Apply patches only if we're hosting AND patching wasn't disabled.
+	// Failure is non-fatal: print a clear warning and keep going so the map UI
+	// still works (the user can then use viewer mode or fix the perm issue).
+	patched := false
+	if smPresent && !*noPatch {
 		if err := applyAllPatches(*smPath); err != nil {
-			fmt.Fprintf(os.Stderr, "\nCould not patch Scrap Mechanic Lua files:\n  %v\n\n", err)
-			fmt.Fprintln(os.Stderr, "If this looks like a permissions error, right-click smoverview.exe and choose 'Run as administrator'.")
-			fmt.Fprintln(os.Stderr, "If you'd rather patch manually, re-run with --no-patch.")
-			os.Exit(1)
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintf(os.Stderr, "Could not patch Scrap Mechanic Lua files: %v\n", err)
+			fmt.Fprintln(os.Stderr, "  - To HOST a game with live tracking, right-click smoverview.exe and Run as administrator.")
+			fmt.Fprintln(os.Stderr, "  - To VIEW someone else's hosted game, you can ignore this — the map UI is still running below.")
+			fmt.Fprintln(os.Stderr)
+		} else {
+			patched = true
 		}
-		defer restoreAllPatches(*smPath)
+	}
 
+	if patched {
+		defer restoreAllPatches(*smPath)
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		go func() {
@@ -129,13 +155,6 @@ func main() {
 			os.Exit(0)
 		}()
 	}
-	if info, err := os.Stat(logsDir); err != nil || !info.IsDir() {
-		fmt.Fprintf(os.Stderr, "Could not find Scrap Mechanic logs directory at:\n  %s\n\nPass --sm-path \"<path-to-Scrap Mechanic>\" if your install is elsewhere.\n", logsDir)
-		os.Exit(1)
-	}
-
-	go tailLogs()
-
 	http.HandleFunc("/positions", handlePositions)
 	http.HandleFunc("/cells", handleCells)
 	http.HandleFunc("/tile-info", handleTileInfo)
@@ -149,7 +168,9 @@ func main() {
 	addr := fmt.Sprintf(":%d", *port)
 	localURL := fmt.Sprintf("http://127.0.0.1:%d", *port)
 	fmt.Printf("sm_overview realtime — open %s in your browser\n", localURL)
-	fmt.Printf("tailing logs in %s\n", logsDir)
+	if smPresent {
+		fmt.Printf("tailing logs in %s\n", logsDir)
+	}
 	if lanIPs := lanIPv4s(); len(lanIPs) > 0 {
 		fmt.Printf("LAN access for other players in your game:\n")
 		for _, ip := range lanIPs {
