@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,12 +21,6 @@ import (
 	"syscall"
 	"time"
 )
-
-//go:embed SurvivalGame.lua
-var patchedSurvivalGameLua []byte
-
-//go:embed terrain_overworld.lua
-var patchedTerrainLua []byte
 
 const (
 	defaultSMPath = `C:\Program Files (x86)\Steam\steamapps\common\Scrap Mechanic`
@@ -1116,26 +1109,107 @@ func readTileUUID(path string) (rfc, ms string, ok bool) {
 // back when the .exe exits. SM stays in a clean state any time we're not
 // actively running.
 
+// Patch describes one game file we modify. Transform reads the user's current
+// vanilla content and returns the patched version — anchor-based insertion, so
+// each SM update doesn't need a new binary as long as the anchor strings hold.
 type Patch struct {
 	Name        string // for logs
 	RelGamePath string // relative to <sm-path>
-	Data        []byte // patched file content embedded in the .exe
 	Marker      string // unique substring proving a file is already our patched version
+	Transform   func([]byte) ([]byte, error)
 }
 
 var allPatches = []Patch{
 	{
 		Name:        "SurvivalGame.lua",
 		RelGamePath: filepath.Join("Survival", "Scripts", "game", "SurvivalGame.lua"),
-		Data:        patchedSurvivalGameLua,
 		Marker:      "SMOVERVIEW_POS",
+		Transform:   patchSurvivalGame,
 	},
-	{
-		Name:        "terrain_overworld.lua",
-		RelGamePath: filepath.Join("Survival", "Scripts", "terrain", "terrain_overworld.lua"),
-		Data:        patchedTerrainLua,
-		Marker:      "SMOVERVIEW_CELLS_BEGIN",
-	},
+	// terrain_overworld.lua patching temporarily removed — needs a new
+	// anchor definition for SM 1.0.1 vanilla, which will land in a follow-up.
+}
+
+// insertAfterLine locates needle in data and returns data with insertion
+// spliced in immediately after the newline that terminates needle's line.
+// Fails clearly if needle isn't found so we don't silently no-op.
+func insertAfterLine(data []byte, needle, insertion string) ([]byte, error) {
+	idx := bytes.Index(data, []byte(needle))
+	if idx < 0 {
+		return nil, fmt.Errorf("anchor %q not found in file (SM version drift?)", needle)
+	}
+	afterNeedle := idx + len(needle)
+	lineEnd := bytes.IndexByte(data[afterNeedle:], '\n')
+	insertPoint := len(data)
+	if lineEnd >= 0 {
+		insertPoint = afterNeedle + lineEnd + 1
+	}
+	out := make([]byte, 0, len(data)+len(insertion))
+	out = append(out, data[:insertPoint]...)
+	out = append(out, []byte(insertion)...)
+	out = append(out, data[insertPoint:]...)
+	return out, nil
+}
+
+// Anchor strings — chosen for stability across SM versions (survived
+// 0.7.4.778 → 1.0.1.869 unchanged). Update ONLY if a future SM release
+// removes or renames one.
+const (
+	survivalGameAnchorA = "local SyncInterval = 400 -- 400 ticks | 10 seconds"
+	survivalGameAnchorB = "g_unitManager:sv_onFixedUpdate()"
+)
+
+// The helper function block injected right after anchor A (top-of-file locals).
+// Emits a compact JSON of every connected player's position via sm.log.warning,
+// which the Go binary tails and parses on the other side.
+const survivalGameHelperBlock = `
+-- sm_overview realtime: emit player positions every ~1s via sm.log.warning.
+-- The desktop tool tails logFile.txt and parses SMOVERVIEW_POS lines.
+local PlayerSyncInterval = 40 -- ticks (40 Hz fixed update -> ~1s)
+local g_playerSyncTick = 0
+
+local function writePlayersJson()
+	local allPlayers = sm.player.getAllPlayers()
+	local parts = {}
+	for _, player in ipairs( allPlayers ) do
+		local character = player:getCharacter()
+		if character and sm.exists( character ) then
+			local pos = character:getWorldPosition()
+			parts[#parts + 1] = string.format(
+				'{"id":%d,"name":%q,"x":%.3f,"y":%.3f,"z":%.3f}',
+				player.id, player.name, pos.x, pos.y, pos.z
+			)
+		end
+	end
+	sm.log.warning( "SMOVERVIEW_POS:[" .. table.concat( parts, "," ) .. "]" )
+end
+
+`
+
+// The per-tick hook injected right after anchor B (g_unitManager:sv_onFixedUpdate()).
+// Runs at 40 Hz, throttled to ~1 emit per second.
+const survivalGameTickBlock = `
+	-- sm_overview realtime tick
+	g_playerSyncTick = g_playerSyncTick + 1
+	if g_playerSyncTick >= PlayerSyncInterval then
+		g_playerSyncTick = 0
+		local ok, err = pcall( writePlayersJson )
+		if not ok then
+			sm.log.warning( "sm_overview writePlayersJson failed: " .. tostring( err ) )
+		end
+	end
+`
+
+func patchSurvivalGame(vanilla []byte) ([]byte, error) {
+	withHelper, err := insertAfterLine(vanilla, survivalGameAnchorA, survivalGameHelperBlock)
+	if err != nil {
+		return nil, fmt.Errorf("SurvivalGame.lua anchor A: %w", err)
+	}
+	withTick, err := insertAfterLine(withHelper, survivalGameAnchorB, survivalGameTickBlock)
+	if err != nil {
+		return nil, fmt.Errorf("SurvivalGame.lua anchor B: %w", err)
+	}
+	return withTick, nil
 }
 
 func backupPathFor(gameFile string) string {
@@ -1171,12 +1245,16 @@ func applyOnePatch(smPath string, p Patch) error {
 		return nil
 	}
 
-	// Fresh vanilla file. Back it up first, then write the patched version.
+	// Fresh vanilla — compute the patched content from what the user actually
+	// has (not from a stale snapshot baked into the .exe), back up, then write.
+	patched, err := p.Transform(current)
+	if err != nil {
+		return fmt.Errorf("transform %s: %w", p.Name, err)
+	}
 	if err := os.WriteFile(backupFile, current, 0o644); err != nil {
 		return fmt.Errorf("write backup %s: %w (try running as administrator)", backupFile, err)
 	}
-	if err := os.WriteFile(gameFile, p.Data, 0o644); err != nil {
-		// Try to undo the backup-write if patch-write failed.
+	if err := os.WriteFile(gameFile, patched, 0o644); err != nil {
 		_ = os.Remove(backupFile)
 		return fmt.Errorf("write patched %s: %w (try running as administrator)", gameFile, err)
 	}
