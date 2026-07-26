@@ -1126,8 +1126,12 @@ var allPatches = []Patch{
 		Marker:      "SMOVERVIEW_POS",
 		Transform:   patchSurvivalGame,
 	},
-	// terrain_overworld.lua patching temporarily removed — needs a new
-	// anchor definition for SM 1.0.1 vanilla, which will land in a follow-up.
+	{
+		Name:        "terrain_overworld.lua",
+		RelGamePath: filepath.Join("Survival", "Scripts", "terrain", "terrain_overworld.lua"),
+		Marker:      "SMOVERVIEW_CELLS_BEGIN",
+		Transform:   patchTerrainOverworld,
+	},
 }
 
 // insertAfterLine locates needle in data and returns data with insertion
@@ -1149,6 +1153,36 @@ func insertAfterLine(data []byte, needle, insertion string) ([]byte, error) {
 	out = append(out, []byte(insertion)...)
 	out = append(out, data[insertPoint:]...)
 	return out, nil
+}
+
+// insertAfterAllLines is like insertAfterLine but inserts insertion after
+// every occurrence of needle. Used when the same anchor is called from
+// multiple code paths (e.g. terrain_overworld.lua's CreateCellDataStorage()
+// runs from both Create() and Load()). A Lua-side guard prevents
+// duplicate work if two injection sites fire in the same session.
+func insertAfterAllLines(data []byte, needle, insertion string) ([]byte, error) {
+	if !bytes.Contains(data, []byte(needle)) {
+		return nil, fmt.Errorf("anchor %q not found in file (SM version drift?)", needle)
+	}
+	var out bytes.Buffer
+	offset := 0
+	for offset < len(data) {
+		idx := bytes.Index(data[offset:], []byte(needle))
+		if idx < 0 {
+			out.Write(data[offset:])
+			break
+		}
+		afterNeedle := offset + idx + len(needle)
+		lineEnd := bytes.IndexByte(data[afterNeedle:], '\n')
+		insertPoint := len(data)
+		if lineEnd >= 0 {
+			insertPoint = afterNeedle + lineEnd + 1
+		}
+		out.Write(data[offset:insertPoint])
+		out.WriteString(insertion)
+		offset = insertPoint
+	}
+	return out.Bytes(), nil
 }
 
 // Anchor strings — chosen for stability across SM versions (survived
@@ -1210,6 +1244,63 @@ func patchSurvivalGame(vanilla []byte) ([]byte, error) {
 		return nil, fmt.Errorf("SurvivalGame.lua anchor B: %w", err)
 	}
 	return withTick, nil
+}
+
+// terrain_overworld.lua patching. The Create() (new world) and Load() (existing
+// world) functions both end with CreateCellDataStorage(); by that point
+// g_cellData is fully populated so it's the right spot to dump cells from.
+// _G.g_smOverviewCellsEmitted prevents re-emitting if both paths fire in one
+// Lua state.
+const terrainOverworldAnchor = "CreateCellDataStorage()"
+
+const terrainOverworldBlock = `
+	-- sm_overview realtime: emit cells for the map tool via sm.log.warning.
+	-- Chunked so no single log line gets huge; the desktop tool reassembles.
+	if not _G.g_smOverviewCellsEmitted then
+		_G.g_smOverviewCellsEmitted = true
+		local bounds = g_cellData and g_cellData.bounds
+		if bounds and bounds.xMin and bounds.xMax and bounds.yMin and bounds.yMax then
+			local cellCount = 0
+			for y = bounds.yMin, bounds.yMax do
+				for x = bounds.xMin, bounds.xMax do cellCount = cellCount + 1 end
+			end
+			sm.log.warning( string.format(
+				'SMOVERVIEW_CELLS_BEGIN:{"seed":%s,"count":%d}',
+				tostring(g_cellData.seed or 0), cellCount
+			) )
+			local BATCH_SIZE = 100
+			local batch = {}
+			for y = bounds.yMin, bounds.yMax do
+				for x = bounds.xMin, bounds.xMax do
+					local uid = g_cellData.uid and g_cellData.uid[y] and g_cellData.uid[y][x]
+					local s = string.format( '{"x":%d,"y":%d', x, y )
+					if uid and not uid:isNil() then
+						s = s .. string.format( ',"t":%q', tostring(uid) )
+					end
+					s = s .. '}'
+					batch[#batch+1] = s
+					if #batch >= BATCH_SIZE then
+						sm.log.warning( 'SMOVERVIEW_CELLS:[' .. table.concat(batch, ',') .. ']' )
+						batch = {}
+					end
+				end
+			end
+			if #batch > 0 then
+				sm.log.warning( 'SMOVERVIEW_CELLS:[' .. table.concat(batch, ',') .. ']' )
+			end
+			sm.log.warning( 'SMOVERVIEW_CELLS_END' )
+		else
+			sm.log.warning( "sm_overview: g_cellData bounds missing, skipping cell dump" )
+		end
+	end
+`
+
+func patchTerrainOverworld(vanilla []byte) ([]byte, error) {
+	out, err := insertAfterAllLines(vanilla, terrainOverworldAnchor, terrainOverworldBlock)
+	if err != nil {
+		return nil, fmt.Errorf("terrain_overworld.lua anchor: %w", err)
+	}
+	return out, nil
 }
 
 func backupPathFor(gameFile string) string {
